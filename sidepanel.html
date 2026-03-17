@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Google Calendar</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      color: var(--text);
+      transition: background 0.3s, color 0.3s;
+    }
+
+    /* ---- Light theme (default) ---- */
+    :root {
+      --bg: #f8f9fa;
+      --surface: #fff;
+      --border: #e0e0e0;
+      --border-light: #e8eaed;
+      --border-lighter: #f1f3f4;
+      --text: #202124;
+      --text-secondary: #5f6368;
+      --text-tertiary: #70757a;
+      --text-muted: #9aa0a6;
+      --primary: #1a73e8;
+      --primary-light: #e8f0fe;
+      --primary-hover: #1557b0;
+      --primary-disabled: #94bef7;
+      --green: #34a853;
+      --green-light: #e6f4ea;
+      --red: #ea4335;
+      --red-light: #fce8e6;
+      --hover-bg: #f1f3f4;
+      --skeleton: #e8eaed;
+      --skeleton-shine: #f8f9fa;
+      --card-shadow: rgba(0,0,0,0.1);
+      --now-shadow: rgba(26,115,232,0.3);
+    }
+
+    /* ---- Dark theme ---- */
+    body.dark {
+      --bg: #1e1e1e;
+      --surface: #2d2d2d;
+      --border: #404040;
+      --border-light: #383838;
+      --border-lighter: #333;
+      --text: #e0e0e0;
+      --text-secondary: #aaa;
+      --text-tertiary: #888;
+      --text-muted: #666;
+      --primary: #8ab4f8;
+      --primary-light: #1e3a5f;
+      --primary-hover: #aecbfa;
+      --primary-disabled: #3a5070;
+      --green: #81c995;
+      --green-light: #1b3d2a;
+      --red: #f28b82;
+      --red-light: #5a2020;
+      --hover-bg: #383838;
+      --skeleton: #383838;
+      --skeleton-shine: #444;
+      --card-shadow: rgba(0,0,0,0.3);
+      --now-shadow: rgba(138,180,248,0.3);
+    }
+
+    /* ---- Transitions ---- */
+    .screen-fade { animation: fadeIn 0.25s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* ---- Calendar filter ---- */
+    .cal-filter {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      display: none;
+    }
+    .cal-filter.open { display: block; overflow-y: auto; max-height: 300px; }
+    .cal-filter-inner { padding: 8px 12px; }
+    .cal-filter-label {
+      font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;
+      letter-spacing: 0.5px; padding-bottom: 6px; border-bottom: 1px solid var(--border-lighter);
+      margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between;
+    }
+    .cal-filter-item {
+      display: flex; align-items: center; gap: 8px; padding: 6px 4px; cursor: pointer;
+      font-size: 13px; color: var(--text); border-radius: 4px;
+    }
+    .cal-filter-item:hover { background: var(--hover-bg); }
+    .cal-filter-item input[type="checkbox"] {
+      accent-color: var(--primary); margin: 0; width: 16px; height: 16px; cursor: pointer;
+    }
+    .cal-filter-dot {
+      width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+    }
+    .cal-filter-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cal-filter-actions {
+      display: flex; gap: 12px; font-size: 11px;
+    }
+    .cal-filter-actions button {
+      background: none; border: none; cursor: pointer; color: var(--primary); font-size: 11px; padding: 0;
+    }
+    .cal-filter-actions button:hover { text-decoration: underline; }
+
+    /* ---- Toolbar ---- */
+    .toolbar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 12px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    .toolbar-title {
+      font-size: 14px; font-weight: 600; color: var(--primary);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .toolbar-actions { display: flex; align-items: center; gap: 2px; }
+    .toolbar-btn {
+      background: none; border: none; cursor: pointer; color: var(--text-secondary);
+      padding: 4px; border-radius: 4px; display: flex; align-items: center;
+    }
+    .toolbar-btn:hover { background: var(--hover-bg); }
+    .toolbar-btn.spinning svg { animation: spin 0.8s linear infinite; }
+    .toolbar-btn.active { color: var(--primary); }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .content { flex: 1; overflow-y: auto; }
+
+    /* ---- Mini Calendar ---- */
+    .mini-calendar {
+      padding: 10px 12px; background: var(--surface); border-bottom: 1px solid var(--border);
+    }
+    .mini-calendar.collapsed { display: none; }
+    .mini-cal-toggle {
+      display: flex; align-items: center; justify-content: center;
+      padding: 4px; background: var(--surface); border-bottom: 1px solid var(--border);
+      cursor: pointer; font-size: 10px; color: var(--text-tertiary);
+    }
+    .mini-cal-toggle:hover { background: var(--hover-bg); }
+    .mini-cal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .mini-cal-title { font-size: 13px; font-weight: 500; }
+    .mini-cal-nav { display: flex; gap: 2px; }
+    .mini-cal-btn { background: none; border: none; cursor: pointer; color: var(--text-secondary); font-size: 14px; padding: 2px 6px; border-radius: 4px; }
+    .mini-cal-btn:hover { background: var(--hover-bg); }
+    .mini-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; }
+    .mini-cal-day-header { font-size: 10px; color: var(--text-tertiary); padding: 2px 0; font-weight: 500; }
+    .mini-cal-day {
+      font-size: 11px; cursor: pointer; border-radius: 50%;
+      width: 24px; height: 24px; display: flex; align-items: center;
+      justify-content: center; margin: 0 auto; color: var(--text);
+    }
+    .mini-cal-day:hover { background: var(--hover-bg); }
+    .mini-cal-day.today { background: var(--primary); color: #fff; font-weight: 600; }
+    .mini-cal-day.selected { background: var(--primary-light); color: var(--primary); font-weight: 600; }
+    .mini-cal-day.selected.today { background: var(--primary); color: #fff; }
+    .mini-cal-day.has-events { position: relative; }
+    .mini-cal-day.has-events::after {
+      content: ''; position: absolute; bottom: 1px; left: 50%; transform: translateX(-50%);
+      width: 4px; height: 4px; background: var(--primary); border-radius: 50%;
+    }
+    .mini-cal-day.today.has-events::after { background: #fff; }
+    .mini-cal-day.other-month { color: var(--text-muted); }
+
+    /* ---- Next Meeting ---- */
+    .next-meeting { margin: 10px 12px; padding: 12px; background: var(--primary-light); border-radius: 8px; border-left: 4px solid var(--primary); }
+    .next-meeting.happening { border-left-color: var(--green); background: var(--green-light); }
+    .next-meeting-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); margin-bottom: 4px; font-weight: 600; }
+    .next-meeting-title { font-size: 14px; font-weight: 600; color: var(--primary); margin-bottom: 2px; }
+    .next-meeting-time { font-size: 12px; color: var(--text-secondary); }
+    .next-meeting-countdown { font-size: 11px; color: var(--primary); font-weight: 500; margin-top: 4px; }
+
+    /* ---- Day Section ---- */
+    .day-section { padding: 0 12px 8px 12px; }
+    .day-header {
+      font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;
+      letter-spacing: 0.5px; padding: 12px 0 6px 0; position: sticky; top: 0; background: var(--bg); z-index: 1;
+    }
+    .day-header.today { color: var(--primary); }
+
+    /* ---- Event Card ---- */
+    .event-card {
+      display: flex; gap: 10px; padding: 8px 10px; margin-bottom: 4px;
+      border-radius: 6px; background: var(--surface); border: 1px solid var(--border-light);
+      transition: box-shadow 0.15s, margin-bottom 0.2s; cursor: pointer;
+    }
+    .event-card:hover { box-shadow: 0 1px 4px var(--card-shadow); }
+    .event-card.happening-now { border-left: 3px solid var(--primary); background: var(--primary-light); }
+    .event-color { width: 4px; border-radius: 2px; flex-shrink: 0; }
+    .event-details { flex: 1; min-width: 0; }
+    .event-title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .event-time { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+    .event-location { font-size: 11px; color: var(--text-tertiary); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .event-meet-link { font-size: 11px; color: var(--primary); text-decoration: none; display: inline-flex; align-items: center; gap: 3px; margin-top: 3px; }
+    .event-meet-link:hover { text-decoration: underline; }
+    .all-day-badge { font-size: 10px; background: var(--primary-light); color: var(--primary); padding: 1px 6px; border-radius: 3px; font-weight: 500; }
+
+    /* Event expanded details */
+    .event-expanded { max-height: 0; overflow: hidden; transition: max-height 0.3s ease, margin-top 0.3s ease, padding-top 0.3s ease; margin-top: 0; padding-top: 0; border-top: none; }
+    .event-card.expanded .event-expanded { max-height: 200px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-lighter); overflow-y: auto; }
+    .event-card.expanded .event-title { white-space: normal; }
+    .event-desc { font-size: 11px; color: var(--text-secondary); line-height: 1.4; margin-bottom: 4px; max-height: 80px; overflow-y: auto; }
+    .event-attendees { font-size: 10px; color: var(--text-tertiary); line-height: 1.4; }
+    .event-attendee { display: inline-block; background: var(--hover-bg); padding: 1px 6px; border-radius: 10px; margin: 1px 2px; }
+    .event-attendee.declined { text-decoration: line-through; opacity: 0.5; }
+
+    /* ---- Compact mode ---- */
+    body.compact .event-card { padding: 5px 8px; margin-bottom: 2px; }
+    body.compact .event-title { font-size: 12px; }
+    body.compact .event-time { font-size: 10px; margin-top: 1px; }
+    body.compact .event-location { display: none; }
+    body.compact .next-meeting { padding: 8px; margin: 6px 12px; }
+    body.compact .next-meeting-title { font-size: 13px; }
+    body.compact .timeline-event { padding: 2px 6px; }
+
+    /* ---- Timeline ---- */
+    .timeline { padding: 0 12px 8px; }
+    .timeline-header {
+      font-size: 12px; font-weight: 600; color: var(--primary); text-transform: uppercase;
+      letter-spacing: 0.5px; padding: 12px 0 6px 0;
+    }
+    .timeline-container { position: relative; margin-left: 44px; border-left: 2px solid var(--border); }
+    .timeline-hour { position: relative; height: 48px; }
+    .timeline-hour-label {
+      position: absolute; left: -46px; top: -7px; font-size: 10px; color: var(--text-tertiary);
+      width: 38px; text-align: right; font-variant-numeric: tabular-nums;
+    }
+    .timeline-event {
+      position: absolute; border-radius: 4px;
+      padding: 4px 8px; overflow: hidden; z-index: 2;
+      border-left: 3px solid var(--primary); cursor: default;
+      display: flex; flex-direction: column; justify-content: center;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .timeline-event:hover { transform: translateY(-1px); box-shadow: 0 2px 6px var(--card-shadow); z-index: 5; }
+    .timeline-event-title {
+      font-size: 11px; font-weight: 600; color: var(--text);
+      word-wrap: break-word; overflow-wrap: break-word;
+    }
+    .timeline-event-time { font-size: 10px; color: var(--text-secondary); margin-top: 1px; }
+    .timeline-event-meet {
+      font-size: 10px; color: var(--primary); text-decoration: none;
+      margin-top: 1px; display: inline-flex; align-items: center; gap: 2px;
+    }
+    .timeline-event-meet:hover { text-decoration: underline; }
+    .timeline-now-line {
+      position: absolute; left: -6px; right: 0; height: 2px;
+      background: var(--red); z-index: 3;
+    }
+    .timeline-now-dot {
+      position: absolute; left: -6px; top: -4px; width: 10px; height: 10px;
+      background: var(--red); border-radius: 50%;
+    }
+    .timeline-free {
+      position: absolute; left: 8px; right: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; color: var(--green); font-weight: 500; z-index: 1;
+    }
+    .timeline-free-label { background: var(--green-light); padding: 1px 8px; border-radius: 10px; }
+
+    /* ---- States ---- */
+    .state-screen {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 30px 16px; text-align: center; flex: 1;
+    }
+    .state-icon { font-size: 48px; margin-bottom: 16px; }
+    .state-title { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+    .state-desc { font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 16px; }
+
+    /* ---- Skeleton loading ---- */
+    .skeleton-container { padding: 12px; }
+    .skeleton {
+      background: linear-gradient(90deg, var(--skeleton) 25%, var(--skeleton-shine) 50%, var(--skeleton) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+      border-radius: 4px;
+    }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    .skeleton-line { height: 12px; margin-bottom: 8px; }
+    .skeleton-line.short { width: 60%; }
+    .skeleton-line.medium { width: 80%; }
+    .skeleton-card { height: 56px; margin-bottom: 8px; border-radius: 6px; }
+    .skeleton-calendar { height: 160px; margin-bottom: 8px; border-radius: 6px; }
+
+    /* ---- Buttons ---- */
+    .btn-primary {
+      padding: 10px 24px; background: var(--primary); color: #fff; border: none;
+      border-radius: 4px; font-size: 14px; cursor: pointer; font-weight: 500;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-primary:disabled { background: var(--primary-disabled); cursor: not-allowed; }
+    .btn-secondary {
+      padding: 8px 16px; background: var(--surface); color: var(--primary); border: 1px solid var(--border);
+      border-radius: 4px; font-size: 13px; cursor: pointer; margin-top: 8px;
+      transition: background 0.15s;
+    }
+    .btn-secondary:hover { background: var(--hover-bg); }
+
+    .error-box {
+      margin-top: 12px; padding: 10px; background: var(--red-light); border-radius: 4px;
+      font-size: 12px; color: var(--red); max-width: 280px; word-break: break-word; text-align: left;
+    }
+    .debug-box {
+      margin-top: 12px; padding: 10px; background: var(--hover-bg); border-radius: 4px;
+      font-size: 11px; color: var(--text-secondary); max-width: 280px; word-break: break-all; text-align: left;
+    }
+    .debug-box code { font-family: monospace; font-size: 10px; display: block; margin: 4px 0; background: var(--skeleton); padding: 4px; border-radius: 2px; }
+    .copy-btn {
+      font-size: 10px; color: var(--primary); background: none; border: 1px solid var(--border);
+      padding: 2px 8px; border-radius: 3px; cursor: pointer; margin-top: 4px;
+    }
+    .copy-btn:hover { background: var(--primary-light); }
+
+    .empty-day { padding: 16px 0; text-align: center; font-size: 12px; color: var(--text-muted); }
+
+    .setup-steps { text-align: left; font-size: 12px; color: var(--text-secondary); line-height: 1.6; margin: 12px 0; max-width: 280px; }
+    .setup-steps li { margin-bottom: 6px; }
+
+    .token-input { width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 12px; margin: 8px 0; font-family: monospace; background: var(--surface); color: var(--text); }
+
+    /* ---- Day summary card ---- */
+    .day-summary-panel { display: none; }
+    .day-summary-panel.open { display: block; }
+    .day-summary { margin: 8px 12px; padding: 10px 12px; background: var(--surface); border-radius: 8px; border: 1px solid var(--border-light); }
+    .day-summary-title { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+    .day-summary-stats { display: flex; gap: 12px; flex-wrap: wrap; }
+    .day-summary-stat { display: flex; flex-direction: column; align-items: center; min-width: 50px; }
+    .day-summary-value { font-size: 18px; font-weight: 700; color: var(--primary); }
+    .day-summary-value.free { color: var(--green); }
+    .day-summary-value.busy { color: var(--red); }
+    .day-summary-label { font-size: 9px; color: var(--text-tertiary); text-transform: uppercase; margin-top: 2px; }
+    .day-summary-bar { width: 100%; height: 6px; background: var(--border-lighter); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+    .day-summary-bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
+    .day-summary-focus { margin-top: 6px; font-size: 10px; color: var(--green); font-weight: 500; }
+    .day-summary-warning { margin-top: 6px; font-size: 10px; color: var(--red); font-weight: 500; display: flex; align-items: center; gap: 4px; }
+
+    /* ---- Meeting warning banner (legacy small banner) ---- */
+    .meeting-warning { margin: 0 12px 8px; padding: 8px 12px; background: var(--red-light); border-radius: 6px; border-left: 3px solid var(--red); display: flex; align-items: center; gap: 8px; animation: pulse 2s infinite; }
+    .meeting-warning-text { font-size: 12px; font-weight: 600; color: var(--red); flex: 1; }
+    .meeting-warning-action { font-size: 11px; color: var(--primary); text-decoration: none; font-weight: 500; white-space: nowrap; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+    /* ---- Full-screen meeting alert overlay ---- */
+    .meeting-alert-overlay {
+      position: fixed; inset: 0; z-index: 9999;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; padding: 24px;
+      animation: greenBlueShift 4s ease-in-out infinite;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.5s ease;
+    }
+    .meeting-alert-overlay.active {
+      opacity: 1; pointer-events: auto;
+    }
+    @keyframes greenBlueShift {
+      0%   { background: #34a853; }
+      25%  { background: #2b9a6e; }
+      50%  { background: #1a73e8; }
+      75%  { background: #2b9a6e; }
+      100% { background: #34a853; }
+    }
+    .meeting-alert-icon {
+      font-size: 56px; margin-bottom: 16px;
+      animation: alertBounce 2s ease-in-out infinite;
+    }
+    @keyframes alertBounce {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.15); }
+    }
+    .meeting-alert-label {
+      font-size: 13px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 2px; color: rgba(255,255,255,0.85); margin-bottom: 8px;
+    }
+    .meeting-alert-title {
+      font-size: 22px; font-weight: 700; color: #fff;
+      margin-bottom: 6px; max-width: 280px;
+      text-shadow: 0 1px 4px rgba(0,0,0,0.2);
+    }
+    .meeting-alert-time {
+      font-size: 14px; color: rgba(255,255,255,0.9);
+      margin-bottom: 28px;
+    }
+    .meeting-alert-buttons {
+      display: flex; flex-direction: column; gap: 12px; width: 100%; max-width: 220px;
+    }
+    .meeting-alert-join {
+      padding: 14px 24px; background: #fff; color: #1a73e8;
+      border: none; border-radius: 28px; font-size: 16px; font-weight: 700;
+      cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+      transition: transform 0.15s, box-shadow 0.15s;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    .meeting-alert-join:hover {
+      transform: scale(1.05); box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+    }
+    .meeting-alert-close {
+      padding: 10px 24px; background: rgba(255,255,255,0.2); color: #fff;
+      border: 2px solid rgba(255,255,255,0.5); border-radius: 28px;
+      font-size: 14px; font-weight: 600; cursor: pointer;
+      transition: background 0.15s;
+    }
+    .meeting-alert-close:hover {
+      background: rgba(255,255,255,0.35);
+    }
+
+    /* ---- Event Detail Full Screen ---- */
+    .event-detail-screen {
+      position: fixed; inset: 0; z-index: 500;
+      background: var(--bg); display: flex; flex-direction: column;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.25s ease, transform 0.25s ease;
+      transform: translateX(100%);
+    }
+    .event-detail-screen.active {
+      opacity: 1; pointer-events: auto; transform: translateX(0);
+    }
+    .detail-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 12px; background: var(--surface);
+      border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    .detail-back-btn {
+      background: none; border: none; cursor: pointer; color: var(--text-secondary);
+      padding: 4px; border-radius: 4px; display: flex; align-items: center;
+    }
+    .detail-back-btn:hover { background: var(--hover-bg); }
+    .detail-header-title {
+      font-size: 14px; font-weight: 600; color: var(--text);
+      flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .detail-body { flex: 1; overflow-y: auto; padding: 16px; }
+    .detail-color-bar { height: 6px; border-radius: 3px; margin-bottom: 16px; }
+    .detail-title { font-size: 20px; font-weight: 700; color: var(--text); margin-bottom: 4px; line-height: 1.3; }
+    .detail-response-badge {
+      display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 10px;
+      border-radius: 12px; margin-bottom: 12px;
+    }
+    .detail-response-badge.accepted { background: var(--green-light); color: var(--green); }
+    .detail-response-badge.declined { background: var(--red-light); color: var(--red); }
+    .detail-response-badge.tentative { background: #fef7e0; color: #e37400; }
+    .detail-response-badge.needsAction { background: var(--hover-bg); color: var(--text-secondary); }
+    body.dark .detail-response-badge.tentative { background: #4a3a10; color: #f6bf26; }
+
+    .detail-section {
+      margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-lighter);
+    }
+    .detail-section:last-child { border-bottom: none; }
+    .detail-section-label {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.5px; color: var(--text-tertiary); margin-bottom: 6px;
+    }
+    .detail-datetime {
+      font-size: 14px; color: var(--text); display: flex; align-items: center; gap: 8px;
+    }
+    .detail-datetime-icon { color: var(--text-tertiary); flex-shrink: 0; }
+    .detail-date-line { font-weight: 600; }
+    .detail-time-line { font-size: 13px; color: var(--text-secondary); }
+
+    .detail-meet-btn {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 16px; background: var(--primary); color: #fff;
+      border: none; border-radius: 8px; font-size: 14px; font-weight: 600;
+      cursor: pointer; width: 100%; justify-content: center;
+      transition: background 0.15s;
+    }
+    .detail-meet-btn:hover { background: var(--primary-hover); }
+
+    .detail-location {
+      font-size: 13px; color: var(--text-secondary);
+      display: flex; align-items: flex-start; gap: 8px;
+    }
+    .detail-location-icon { color: var(--text-tertiary); flex-shrink: 0; margin-top: 1px; }
+
+    .detail-description {
+      font-size: 13px; color: var(--text-secondary); line-height: 1.6;
+      word-break: break-word;
+    }
+    .detail-description a { color: var(--primary); }
+
+    .detail-organizer {
+      font-size: 13px; color: var(--text-secondary);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .detail-organizer-avatar {
+      width: 24px; height: 24px; border-radius: 50%;
+      background: var(--primary-light); color: var(--primary);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 700; flex-shrink: 0;
+    }
+
+    /* Guests section */
+    .detail-guests-header {
+      display: flex; align-items: center; justify-content: space-between; cursor: pointer;
+      padding: 6px 0;
+    }
+    .detail-guests-header:hover { opacity: 0.8; }
+    .detail-guests-count { font-size: 13px; font-weight: 600; color: var(--text); }
+    .detail-guests-toggle {
+      font-size: 11px; color: var(--text-tertiary); transition: transform 0.2s;
+    }
+    .detail-guests-list {
+      max-height: 0; overflow: hidden; transition: max-height 0.3s ease;
+    }
+    .detail-guests-list.open { max-height: 500px; overflow-y: auto; }
+    .detail-guest {
+      display: flex; align-items: center; gap: 8px; padding: 5px 0;
+      font-size: 12px; color: var(--text);
+    }
+    .detail-guest-avatar {
+      width: 28px; height: 28px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 600; flex-shrink: 0;
+    }
+    .detail-guest-info { flex: 1; min-width: 0; }
+    .detail-guest-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .detail-guest-email { font-size: 11px; color: var(--text-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .detail-guest-status {
+      font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 8px; flex-shrink: 0;
+    }
+    .detail-guest-status.accepted { background: var(--green-light); color: var(--green); }
+    .detail-guest-status.declined { background: var(--red-light); color: var(--red); }
+    .detail-guest-status.tentative { background: #fef7e0; color: #e37400; }
+    .detail-guest-status.needsAction { background: var(--hover-bg); color: var(--text-muted); }
+    body.dark .detail-guest-status.tentative { background: #4a3a10; color: #f6bf26; }
+
+    /* Attachments */
+    .detail-attachment {
+      display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+      background: var(--surface); border: 1px solid var(--border-light);
+      border-radius: 6px; margin-bottom: 6px; text-decoration: none;
+      transition: background 0.15s;
+    }
+    .detail-attachment:hover { background: var(--hover-bg); }
+    .detail-attachment-icon { font-size: 18px; flex-shrink: 0; }
+    .detail-attachment-info { flex: 1; min-width: 0; }
+    .detail-attachment-name {
+      font-size: 12px; font-weight: 500; color: var(--text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .detail-attachment-type { font-size: 10px; color: var(--text-tertiary); }
+
+    /* ---- Needs response indicator ---- */
+    /* -- Needs response (not responded) -- */
+    .event-card.needs-response {
+      border: 2px dashed #e37400; border-left: 4px solid #e37400;
+      background: repeating-linear-gradient(
+        -45deg, transparent, transparent 6px, #fef7e030 6px, #fef7e030 12px
+      );
+    }
+    body.dark .event-card.needs-response {
+      border-color: #f6bf26;
+      background: repeating-linear-gradient(
+        -45deg, transparent, transparent 6px, #4a3a1030 6px, #4a3a1030 12px
+      );
+    }
+    .event-needs-response-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.3px; padding: 2px 8px; border-radius: 3px;
+      background: #e37400; color: #fff; margin-top: 4px;
+    }
+    body.dark .event-needs-response-badge { background: #f6bf26; color: #1e1e1e; }
+
+    .timeline-event.needs-response {
+      border: 2px dashed #e37400 !important; border-left: 4px solid #e37400 !important;
+      background: repeating-linear-gradient(
+        -45deg, transparent, transparent 6px, #fef7e040 6px, #fef7e040 12px
+      ) !important;
+    }
+    body.dark .timeline-event.needs-response {
+      border-color: #f6bf26 !important;
+      background: repeating-linear-gradient(
+        -45deg, transparent, transparent 6px, #4a3a1040 6px, #4a3a1040 12px
+      ) !important;
+    }
+    .timeline-needs-badge {
+      display: inline-block; font-size: 9px; font-weight: 800; color: #fff;
+      background: #e37400; padding: 1px 5px; border-radius: 3px;
+      letter-spacing: 0.3px;
+    }
+    body.dark .timeline-needs-badge { background: #f6bf26; color: #1e1e1e; }
+
+    .next-meeting.needs-response {
+      background: repeating-linear-gradient(
+        -45deg, transparent, transparent 6px, #fef7e030 6px, #fef7e030 12px
+      ), var(--primary-light);
+      border: 2px dashed #e37400; border-left: 4px solid #e37400;
+    }
+    body.dark .next-meeting.needs-response { border-color: #f6bf26; }
+    .next-meeting-needs-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 10px; font-weight: 700;
+      color: #e37400; margin-top: 4px;
+    }
+    body.dark .next-meeting-needs-badge { color: #f6bf26; }
+
+    /* -- Maybe / tentative -- */
+    .event-card.tentative-response {
+      border-left: 4px dashed #e37400; opacity: 0.75;
+    }
+    body.dark .event-card.tentative-response { border-left-color: #f6bf26; }
+    .event-tentative-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 10px; font-weight: 600;
+      padding: 2px 8px; border-radius: 3px;
+      background: #fef7e0; color: #e37400; margin-top: 4px;
+    }
+    body.dark .event-tentative-badge { background: #4a3a10; color: #f6bf26; }
+
+    .timeline-event.tentative-response {
+      border-left: 4px dashed #e37400 !important; opacity: 0.7;
+    }
+    body.dark .timeline-event.tentative-response { border-left-color: #f6bf26 !important; }
+    .timeline-tentative-badge {
+      display: inline-block; font-size: 9px; font-weight: 700; color: #e37400;
+      background: #fef7e0; padding: 1px 5px; border-radius: 3px;
+    }
+    body.dark .timeline-tentative-badge { background: #4a3a10; color: #f6bf26; }
+
+    .next-meeting.tentative-response {
+      border-left: 4px dashed #e37400; opacity: 0.75;
+    }
+    body.dark .next-meeting.tentative-response { border-left-color: #f6bf26; }
+    .next-meeting-tentative-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 10px; font-weight: 600;
+      color: #e37400; margin-top: 4px;
+    }
+    body.dark .next-meeting-tentative-badge { color: #f6bf26; }
+
+    /* ---- RSVP buttons ---- */
+    .detail-rsvp {
+      display: flex; gap: 8px; margin-top: 4px;
+    }
+    .detail-rsvp-btn {
+      flex: 1; padding: 9px 8px; border-radius: 8px; border: 2px solid var(--border);
+      background: var(--surface); font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: all 0.15s; text-align: center;
+      color: var(--text-secondary);
+    }
+    .detail-rsvp-btn:hover { border-color: var(--text-muted); }
+    .detail-rsvp-btn.active-yes {
+      background: var(--green-light); border-color: var(--green); color: var(--green);
+    }
+    .detail-rsvp-btn.active-no {
+      background: var(--red-light); border-color: var(--red); color: var(--red);
+    }
+    .detail-rsvp-btn.active-maybe {
+      background: #fef7e0; border-color: #e37400; color: #e37400;
+    }
+    body.dark .detail-rsvp-btn.active-maybe {
+      background: #4a3a10; border-color: #f6bf26; color: #f6bf26;
+    }
+    .detail-rsvp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .detail-rsvp-status {
+      font-size: 11px; color: var(--text-tertiary); text-align: center; margin-top: 6px;
+    }
+
+    /* ---- Quick action buttons ---- */
+    .event-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+    .event-action-btn { font-size: 10px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--primary); cursor: pointer; display: inline-flex; align-items: center; gap: 3px; transition: background 0.15s; }
+    .event-action-btn:hover { background: var(--primary-light); }
+
+    /* ---- Toast notification ---- */
+    .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(60px); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 20px; font-size: 12px; font-weight: 500; z-index: 100; opacity: 0; transition: transform 0.3s ease, opacity 0.3s ease; pointer-events: none; }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* ---- Focus block in timeline ---- */
+    .timeline-focus { position: absolute; left: 8px; right: 8px; display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--green); font-weight: 500; z-index: 1; border: 1px dashed var(--green); border-radius: 4px; background: var(--green-light); opacity: 0.6; }
+
+    /* ---- Countdown color shift ---- */
+    .next-meeting-countdown.urgent { color: var(--red); font-weight: 600; }
+    .next-meeting-countdown.soon { color: #e37400; font-weight: 600; }
+
+    /* ---- Week stats ---- */
+    .week-stats { margin: 0 12px 8px; padding: 8px 12px; background: var(--surface); border-radius: 6px; border: 1px solid var(--border-light); font-size: 11px; color: var(--text-secondary); display: flex; justify-content: space-between; align-items: center; }
+    .week-stats-item { text-align: center; }
+    .week-stats-value { font-size: 14px; font-weight: 700; color: var(--text); display: block; }
+
+    /* ---- Better empty states ---- */
+    .empty-state { padding: 24px 16px; text-align: center; }
+    .empty-state-icon { font-size: 36px; margin-bottom: 8px; opacity: 0.6; }
+    .empty-state-text { font-size: 13px; color: var(--text-secondary); }
+    .empty-state-hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+  </style>
+</head>
+<body>
+
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <div class="toolbar-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+        <line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/>
+        <line x1="3" y1="10" x2="21" y2="10"/>
+      </svg>
+      Calendar
+    </div>
+    <div class="toolbar-actions">
+      <button class="toolbar-btn" id="daySummaryBtn" title="Today at a glance" style="display:none;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="12" width="4" height="9"/><rect x="10" y="7" width="4" height="14"/><rect x="17" y="3" width="4" height="18"/>
+        </svg>
+      </button>
+      <button class="toolbar-btn" id="calFilterBtn" title="Filter calendars" style="display:none;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+        </svg>
+      </button>
+      <button class="toolbar-btn" id="compactBtn" title="Toggle compact mode" style="display:none;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
+      <button class="toolbar-btn" id="darkModeBtn" title="Toggle dark mode" style="display:none;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+      <button class="toolbar-btn" id="refreshBtn" title="Refresh" style="display:none;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- SCREEN: Setup needed -->
+  <div id="setupScreen" class="state-screen" style="display:none;">
+    <div class="state-icon">🔧</div>
+    <div class="state-title">Setup Required</div>
+    <div class="state-desc">You need to add your Google Cloud Client ID to use this extension.</div>
+    <div class="debug-box" id="setupInfo"></div>
+  </div>
+
+  <!-- SCREEN: Auth -->
+  <div id="authScreen" class="state-screen">
+    <div class="state-icon">📅</div>
+    <div class="state-title">Connect Google Calendar</div>
+    <div class="state-desc">Sign in with your Google account to see your calendar events.</div>
+    <button class="btn-primary" id="signInBtn">Sign in with Google</button>
+    <div id="authError" class="error-box" style="display:none;"></div>
+    <div id="authDebug" class="debug-box" style="display:none;"></div>
+    <button class="btn-secondary" id="showManualBtn" style="margin-top:16px;font-size:11px;">Having trouble? Enter token manually</button>
+  </div>
+
+  <!-- SCREEN: Manual token entry -->
+  <div id="manualScreen" class="state-screen" style="display:none;">
+    <div class="state-icon">🔑</div>
+    <div class="state-title">Manual Token Entry</div>
+    <div class="state-desc">If automatic sign-in doesn't work, you can get a token manually:</div>
+    <ol class="setup-steps">
+      <li>Click the button below to open Google's auth page</li>
+      <li>Sign in and click "Allow"</li>
+      <li>You'll be redirected — copy the <b>access_token</b> value from the URL bar</li>
+      <li>Paste it below and click Save</li>
+    </ol>
+    <button class="btn-secondary" id="openAuthPageBtn">Open Google Auth Page</button>
+    <input type="text" class="token-input" id="manualTokenInput" placeholder="Paste your access_token here..." />
+    <button class="btn-primary" id="saveManualTokenBtn" style="margin-top:4px;">Save Token</button>
+    <button class="btn-secondary" id="backToAuthBtn">Back</button>
+    <div id="manualError" class="error-box" style="display:none;"></div>
+    <div id="manualDebug" class="debug-box" style="display:none;"></div>
+  </div>
+
+  <!-- SCREEN: Loading (skeleton) -->
+  <div id="loadingScreen" class="state-screen" style="display:none;">
+    <div class="skeleton-container" style="width:100%;">
+      <div class="skeleton skeleton-calendar"></div>
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-line medium"></div>
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-line short"></div>
+      <div class="skeleton skeleton-card"></div>
+    </div>
+  </div>
+
+  <!-- SCREEN: Main Calendar -->
+  <div id="mainContent" style="display:none;flex:1;overflow-y:auto;flex-direction:column;">
+    <div class="mini-calendar" id="miniCalendar"></div>
+    <div class="mini-cal-toggle" id="miniCalToggle">Hide calendar ▴</div>
+    <div class="cal-filter" id="calFilterPanel"><div class="cal-filter-inner" id="calFilterList"></div></div>
+    <div id="daySummaryContainer" class="day-summary-panel"></div>
+    <div id="meetingWarningContainer"></div>
+    <div id="nextMeetingContainer"></div>
+    <div id="timelineContainer"></div>
+    <div id="eventsContainer" class="content"></div>
+    <div id="weekStatsContainer"></div>
+    <div style="padding:12px;text-align:center;">
+      <button class="btn-secondary" id="signOutBtn">Sign out</button>
+    </div>
+  </div>
+
+  <!-- Event Detail Full Screen -->
+  <div class="event-detail-screen" id="eventDetailScreen">
+    <div class="detail-header">
+      <button class="detail-back-btn" id="detailBackBtn" title="Back">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="15 18 9 12 15 6"/>
+        </svg>
+      </button>
+      <div class="detail-header-title" id="detailHeaderTitle">Event Details</div>
+      <a class="toolbar-btn" id="detailOpenCal" title="Open in Google Calendar" target="_blank">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+          <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+        </svg>
+      </a>
+    </div>
+    <div class="detail-body" id="detailBody"></div>
+  </div>
+
+  <!-- Full-screen meeting alert overlay -->
+  <div class="meeting-alert-overlay" id="meetingAlertOverlay">
+    <div class="meeting-alert-icon">📹</div>
+    <div class="meeting-alert-label">Meeting starting</div>
+    <div class="meeting-alert-title" id="meetingAlertTitle"></div>
+    <div class="meeting-alert-time" id="meetingAlertTime"></div>
+    <div class="meeting-alert-buttons">
+      <button class="meeting-alert-join" id="meetingAlertJoin">📞 Join Call</button>
+      <button class="meeting-alert-close" id="meetingAlertClose">Close</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="sidepanel.js"></script>
+</body>
+</html>
