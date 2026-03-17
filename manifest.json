@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Google Calendar Side Panel",
+  "version": "6.0",
+  "short_name": "Cal Panel",
+  "description": "Always-visible Google Calendar in your browser's side panel",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "identity",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://www.googleapis.com/*",
+    "https://accounts.google.com/*"
+  ],
+  "oauth2": {
+    "client_id": "213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/calendar.events",
+      "https://www.googleapis.com/auth/calendar.readonly"
+    ]
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Toggle Google Calendar Side Panel",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["oauth_callback.html", "oauth_callback.js"],
+      "matches": ["https://accounts.google.com/*"]
+    }
+  ]
+}
