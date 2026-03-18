@@ -8,7 +8,6 @@
     let selectedDate = null; // clicked date in mini calendar
     let refreshInterval = null;
     let countdownInterval = null;
-    let tokenPollInterval = null;
     let showUpcoming = false;
     let miniCalCollapsed = false;
     let compactMode = false;
@@ -111,12 +110,33 @@
     // ---- API ----
     async function fetchCalendarList() {
       if (!authToken) return [];
-      try {
-        const res = await fetch(
+
+      const doFetch = async () => {
+        return await fetch(
           'https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader',
           { headers: { Authorization: `Bearer ${authToken}` } }
         );
+      };
+
+      try {
+        let res = await doFetch();
+
+        // On 401, try re-auth then retry
+        if (res.status === 401) {
+          const refreshed = await tryReAuth();
+          if (refreshed) {
+            res = await doFetch();
+          }
+        }
+
+        if (res.status === 401) {
+          showReAuthBanner();
+          return allCalendars.length ? allCalendars : [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
+        }
+
         if (!res.ok) return [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
+
+        clearReAuthBanner();
         const data = await res.json();
         const cals = (data.items || []).filter(c => c.selected !== false);
         allCalendars = cals.map(c => ({
@@ -125,7 +145,6 @@
           backgroundColor: c.backgroundColor || '#1a73e8',
           primary: c.primary || false
         }));
-        // If no saved filter, default to primary calendar only
         if (!enabledCalendarIds) {
           const primary = allCalendars.find(c => c.primary);
           if (primary) {
@@ -137,21 +156,77 @@
         }
         return allCalendars;
       } catch (e) {
-        return [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
+        return allCalendars.length ? allCalendars : [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
       }
     }
 
-    let reAuthAttempted = false;
+    let reAuthPromise = null;
 
-    async function silentReAuth() {
-      console.log('[Auth] Attempting silent re-auth...');
-      const result = await sendMsg({ type: 'startAuth' });
-      if (result && result.token) {
-        authToken = result.token;
-        console.log('[Auth] Silent re-auth succeeded');
-        return true;
-      }
-      return false;
+    async function tryReAuth() {
+      // If a re-auth is already in flight, await the same result
+      if (reAuthPromise) return reAuthPromise;
+
+      reAuthPromise = (async () => {
+        try {
+          // Step 1: Try non-interactive refresh (no popup)
+          const silent = await sendMsg({ type: 'silentRefresh' });
+          if (silent && silent.token) {
+            authToken = silent.token;
+            return true;
+          }
+
+          // Step 2: Check if another tab already refreshed the token
+          const stored = await sendMsg({ type: 'getStoredToken' });
+          if (stored && stored.token && stored.token !== authToken) {
+            authToken = stored.token;
+            return true;
+          }
+
+          // Step 3: Silent failed
+          return false;
+        } finally {
+          reAuthPromise = null;
+        }
+      })();
+
+      return reAuthPromise;
+    }
+
+    function showReAuthBanner() {
+      const c = document.getElementById('reAuthContainer');
+      if (!c) return;
+      if (document.getElementById('reAuthBanner')) return;
+      c.innerHTML = `<div class="session-banner" id="reAuthBanner">
+        <div class="session-banner-text">Session expired — click here to reconnect</div>
+      </div>`;
+      document.getElementById('reAuthBanner').addEventListener('click', async () => {
+        c.innerHTML = `<div class="session-banner">
+          <div class="session-banner-text" style="color:var(--text-secondary);">Reconnecting...</div>
+        </div>`;
+        // Timeout after 30 seconds
+        const timeout = setTimeout(() => {
+          c.innerHTML = `<div class="session-banner" id="reAuthBanner">
+            <div class="session-banner-text">Reconnection timed out — click to try again</div>
+          </div>`;
+          showReAuthBanner(); // Re-attach click listener
+        }, 30000);
+        const result = await sendMsg({ type: 'startAuth' });
+        clearTimeout(timeout);
+        if (result && result.token) {
+          authToken = result.token;
+          c.innerHTML = '';
+          loadEvents();
+        } else {
+          authToken = null;
+          showScreen('authScreen');
+          showError('authError', 'Session expired. Please sign in again.');
+        }
+      });
+    }
+
+    function clearReAuthBanner() {
+      const c = document.getElementById('reAuthContainer');
+      if (c) c.innerHTML = '';
     }
 
     async function fetchEventsForCalendar(calendarId, timeMin, timeMax) {
@@ -175,56 +250,53 @@
       try {
         let res = await doFetch();
 
-        // On 401, try silent re-auth once before giving up
-        if (res.status === 401 && !reAuthAttempted) {
-          reAuthAttempted = true;
-          const refreshed = await silentReAuth();
+        // On 401, try re-auth then retry
+        if (res.status === 401) {
+          const refreshed = await tryReAuth();
           if (refreshed) {
             res = await doFetch();
           }
         }
 
         if (res.status === 401) {
-          authToken = null;
-          showScreen('authScreen');
-          showError('authError', 'Session expired. Please sign in again.');
-          return [];
+          showReAuthBanner();
+          return { items: [], authFailed: true };
         }
-        if (!res.ok) return [];
-        reAuthAttempted = false; // reset on success
+        if (!res.ok) return { items: [], authFailed: false };
+
+        clearReAuthBanner();
         const data = await res.json();
-        return (data.items || []).map(ev => ({ ...ev, _calendarId: calendarId }));
+        return { items: (data.items || []).map(ev => ({ ...ev, _calendarId: calendarId })), authFailed: false };
       } catch (e) {
         console.error('Fetch error:', e);
-        return [];
+        return { items: [], authFailed: false };
       }
     }
 
     async function fetchAllEvents(timeMin, timeMax) {
       const calendars = await fetchCalendarList();
-      if (!calendars.length) return [];
-      // Only fetch enabled calendars
+      if (!calendars.length) return { events: [], ok: false };
       const enabled = enabledCalendarIds
         ? calendars.filter(c => enabledCalendarIds.has(c.id))
         : calendars;
-      if (!enabled.length) return [];
+      if (!enabled.length) return { events: [], ok: true };
       const results = await Promise.all(
         enabled.map(c => fetchEventsForCalendar(c.id, timeMin, timeMax))
       );
-      let all = results.flat();
+      const hadAuthFailure = results.some(r => r.authFailed);
+      let all = results.flatMap(r => r.items);
       // Filter declined events
       all = all.filter(ev => {
         if (!ev.attendees) return true;
         const me = ev.attendees.find(a => a.self);
         return !me || me.responseStatus !== 'declined';
       });
-      // Sort by start time
       all.sort((a, b) => {
         const sa = a.start.dateTime ? new Date(a.start.dateTime) : new Date(a.start.date);
         const sb = b.start.dateTime ? new Date(b.start.dateTime) : new Date(b.start.date);
         return sa - sb;
       });
-      return all;
+      return { events: all, ok: !hadAuthFailure };
     }
 
     // ---- Helpers ----
@@ -1307,15 +1379,39 @@
     }
 
     function sanitizeDescription(html) {
-      // Allow basic formatting but strip scripts
+      // Allowlist-based sanitizer — only safe tags and attributes
+      const ALLOWED_TAGS = new Set(['p','br','b','i','strong','em','a','ul','ol','li','div','span']);
       const div = document.createElement('div');
       div.innerHTML = html;
-      div.querySelectorAll('script,style,iframe,object,embed').forEach(el => el.remove());
-      // Make links open in new tab
-      div.querySelectorAll('a').forEach(a => {
-        a.setAttribute('target', '_blank');
-        a.setAttribute('rel', 'noopener noreferrer');
-      });
+      function walk(node) {
+        // Re-run until stable (handles promoted children from removed parents)
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const child of [...node.children]) {
+            if (!ALLOWED_TAGS.has(child.tagName.toLowerCase())) {
+              child.replaceWith(...child.childNodes);
+              changed = true;
+              break; // Restart scan since DOM changed
+            }
+            // Strip all attributes except href on <a>
+            for (const attr of [...child.attributes]) {
+              if (!(child.tagName === 'A' && attr.name === 'href')) {
+                child.removeAttribute(attr.name);
+              }
+            }
+            if (child.tagName === 'A') {
+              try {
+                if (new URL(child.href).protocol !== 'https:') child.removeAttribute('href');
+              } catch { child.removeAttribute('href'); }
+              child.setAttribute('target', '_blank');
+              child.setAttribute('rel', 'noopener noreferrer');
+            }
+            walk(child);
+          }
+        }
+      }
+      walk(div);
       return div.innerHTML;
     }
 
@@ -1348,15 +1444,16 @@
     async function loadEvents() {
       const now = new Date(), tMin = new Date(now), tMax = new Date(now);
       tMin.setHours(0, 0, 0, 0); tMax.setDate(tMax.getDate() + 14);
-      events = await fetchAllEvents(tMin, tMax);
+      const result = await fetchAllEvents(tMin, tMax);
 
-      // If token was lost during fetch, don't render — auth screen is already showing
-      if (!authToken) return;
+      if (result.ok) {
+        // Successful fetch — update events (even if empty = genuinely empty calendar)
+        events = result.events;
+        if (events.length) cacheEventsToStorage(events);
+      }
+      // On failure, keep cached events but they may be stale
 
-      // Cache for badge/offline use
-      if (events.length) cacheEventsToStorage(events);
       renderAll();
-      // Start meeting warning check every 30s
       clearInterval(warningInterval);
       warningInterval = setInterval(renderMeetingWarning, 30000);
     }
@@ -1372,11 +1469,9 @@
     function clearAllIntervals() {
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
-      clearInterval(tokenPollInterval);
       clearInterval(warningInterval);
       refreshInterval = null;
       countdownInterval = null;
-      tokenPollInterval = null;
       warningInterval = null;
     }
 
@@ -1593,19 +1688,40 @@
       savePrefs();
     });
 
-    // Token polling (with proper cleanup)
-    tokenPollInterval = setInterval(async () => {
-      if (!authToken) {
-        const stored = await sendMsg({ type: 'getStoredToken' });
-        if (stored && stored.token) {
-          authToken = stored.token;
-          showScreen('loadingScreen');
-          await loadEvents();
-          showScreen('mainContent');
-          refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
+    // ---- Cross-tab token sync ----
+    // Replaces token polling — reacts instantly to storage changes from any tab
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+
+      if (changes.accessToken) {
+        const newToken = changes.accessToken.newValue;
+        const oldToken = authToken;
+
+        if (newToken && newToken !== oldToken) {
+          authToken = newToken;
+          clearReAuthBanner();
+
+          // If we're on the auth screen, switch to main and load
+          const authScreenEl = document.getElementById('authScreen');
+          if (authScreenEl && authScreenEl.style.display !== 'none') {
+            showScreen('loadingScreen');
+            loadEvents().then(() => {
+              showScreen('mainContent');
+              if (!refreshInterval) {
+                refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
+              }
+            });
+          }
+        } else if (!newToken && oldToken) {
+          // Token was cleared (sign out from another tab)
+          authToken = null;
+          clearAllIntervals();
+          events = [];
+          showToast('Signed out from another tab');
+          showScreen('authScreen');
         }
       }
-    }, 2000);
+    });
 
     // Start
     init();

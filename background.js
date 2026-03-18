@@ -22,16 +22,20 @@ function getRedirectURL() {
   }
 }
 
-function buildAuthURL(redirectUri) {
+function buildAuthURL(redirectUri, { silent = false } = {}) {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: 'token',
     redirect_uri: redirectUri,
     scope: SCOPES,
-    prompt: 'select_account',
     access_type: 'online'
   });
+  if (!silent) params.set('prompt', 'select_account');
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+function isSafeUrl(url) {
+  try { return new URL(url).protocol === 'https:'; } catch { return false; }
 }
 
 function extractTokenFromUrl(url) {
@@ -54,9 +58,13 @@ async function storeToken(token) {
 }
 
 // ---- ALARMS SETUP ----
-chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
-chrome.alarms.create('checkToken', { periodInMinutes: 1 });
-chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
+// Create alarms on install/update to avoid resetting timers on every worker wake
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
+  chrome.alarms.create('checkToken', { periodInMinutes: 1 });
+  chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
+  chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
+});
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'refreshEvents') {
@@ -74,14 +82,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
           console.log('[Alarms] Token is older than 45 minutes, attempting silent re-auth');
           try {
             const redirectUri = getRedirectURL();
-            const params = new URLSearchParams({
-              client_id: CLIENT_ID,
-              response_type: 'token',
-              redirect_uri: redirectUri,
-              scope: SCOPES,
-              access_type: 'online'
-            });
-            const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+            const authUrl = buildAuthURL(redirectUri, { silent: true });
 
             chrome.identity.launchWebAuthFlow(
               { url: authUrl, interactive: false },
@@ -104,6 +105,85 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       }
     } catch (e) {
       console.error('[Alarms] checkToken error:', e);
+    }
+  }
+
+  if (alarm.name === 'checkNotifications') {
+    try {
+      const data = await chrome.storage.local.get(['cachedEvents', 'notifPrefs', 'notifiedEventKeys']);
+      const prefs = data.notifPrefs || { enabled: true, minutesBefore: 5 };
+      if (!prefs.enabled) return;
+
+      // Load persisted notification tracking (survives service worker termination)
+      const notifiedKeys = new Set(data.notifiedEventKeys || []);
+
+      if (data.cachedEvents && Array.isArray(data.cachedEvents)) {
+        const now = Date.now();
+        const minutesBefore = prefs.minutesBefore || 5;
+        const windowMs = minutesBefore * 60 * 1000;
+        let changed = false;
+
+        const upcoming = [];
+        for (const event of data.cachedEvents) {
+          if (!event.start || !event.start.dateTime || !event.end || !event.end.dateTime) continue;
+          const startMs = new Date(event.start.dateTime).getTime();
+          const timeUntil = startMs - now;
+          if (timeUntil > 0 && timeUntil <= windowMs) {
+            upcoming.push({ event, startMs });
+          }
+        }
+
+        for (const { event, startMs } of upcoming) {
+          const notifKey = `${event.id}::${startMs}`;
+          if (notifiedKeys.has(notifKey)) continue;
+          notifiedKeys.add(notifKey);
+          changed = true;
+
+          const minutesUntil = Math.round((startMs - now) / 60000);
+          const timeText = minutesUntil <= 1 ? 'Starting now' : `In ${minutesUntil} minutes`;
+          const startTime = new Date(event.start.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+          const endTime = new Date(event.end.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+          const notifOptions = {
+            type: 'basic',
+            iconUrl: 'icons/icon128.png',
+            title: event.summary || '(No title)',
+            message: `${timeText} — ${startTime} to ${endTime}`,
+            priority: 2,
+            requireInteraction: minutesUntil <= 2
+          };
+
+          chrome.notifications.create(notifKey, notifOptions);
+        }
+
+        // Auto-dismiss notifications for events that started 10+ minutes ago
+        chrome.notifications.getAll((active) => {
+          for (const id of Object.keys(active)) {
+            const parts = id.split('::');
+            const ts = parseInt(parts[parts.length - 1]);
+            if (ts && now - ts > 10 * 60 * 1000) {
+              chrome.notifications.clear(id);
+            }
+          }
+        });
+
+        // Clean up old notified keys (older than 1 hour)
+        for (const key of notifiedKeys) {
+          const parts = key.split('::');
+          const ts = parseInt(parts[parts.length - 1]);
+          if (ts && now - ts > 3600000) {
+            notifiedKeys.delete(key);
+            changed = true;
+          }
+        }
+
+        // Persist tracking to survive service worker termination
+        if (changed) {
+          await chrome.storage.local.set({ notifiedEventKeys: [...notifiedKeys] });
+        }
+      }
+    } catch (e) {
+      console.error('[Alarms] checkNotifications error:', e);
     }
   }
 
@@ -146,6 +226,42 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       console.error('[Alarms] updateBadge error:', e);
     }
   }
+});
+
+// ---- NOTIFICATION HANDLERS ----
+function findEventFromNotification(notificationId, callback) {
+  chrome.storage.local.get(['cachedEvents'], (data) => {
+    if (!data.cachedEvents) { callback(null); return; }
+    const delimIdx = notificationId.lastIndexOf('::');
+    const eventId = delimIdx !== -1 ? notificationId.substring(0, delimIdx) : notificationId;
+    const event = data.cachedEvents.find(e => e.id === eventId);
+    callback(event || null);
+  });
+}
+
+function openEventUrl(event) {
+  const url = event.hangoutLink || event.htmlLink;
+  if (url && isSafeUrl(url)) {
+    chrome.tabs.create({ url });
+  }
+}
+
+chrome.notifications.onClicked.addListener((notificationId) => {
+  findEventFromNotification(notificationId, (event) => {
+    if (event) openEventUrl(event);
+  });
+  chrome.notifications.clear(notificationId);
+});
+
+chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+  if (buttonIndex === 0) {
+    findEventFromNotification(notificationId, (event) => {
+      if (event && event.hangoutLink && isSafeUrl(event.hangoutLink)) {
+        chrome.tabs.create({ url: event.hangoutLink });
+      }
+    });
+  }
+  chrome.notifications.clear(notificationId);
 });
 
 // ---- AUTH STRATEGY 1: chrome.identity.getAuthToken() ----
@@ -301,6 +417,43 @@ async function authViaTab() {
 // ---- MESSAGE HANDLING ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
+  // Silent token refresh — non-interactive, no popup, with timeout
+  if (message.type === 'silentRefresh') {
+    (async () => {
+      try {
+        const redirectUri = getRedirectURL();
+        const authUrl = buildAuthURL(redirectUri, { silent: true });
+        let responded = false;
+
+        const timeout = setTimeout(() => {
+          if (!responded) { responded = true; sendResponse({ token: null }); }
+        }, 10000);
+
+        chrome.identity.launchWebAuthFlow(
+          { url: authUrl, interactive: false },
+          (responseUrl) => {
+            clearTimeout(timeout);
+            if (responded) return;
+            responded = true;
+            if (chrome.runtime.lastError || !responseUrl) {
+              sendResponse({ token: null });
+              return;
+            }
+            const token = extractTokenFromUrl(responseUrl);
+            if (token) {
+              storeToken(token).then(() => sendResponse({ token }));
+            } else {
+              sendResponse({ token: null });
+            }
+          }
+        );
+      } catch (e) {
+        sendResponse({ token: null });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'startAuth') {
     (async () => {
       console.log('[Auth] Starting authentication...');
@@ -375,20 +528,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'saveManualToken') {
     if (message.token) {
-      storeToken(message.token);
-      sendResponse({ success: true });
+      storeToken(message.token).then(() => sendResponse({ success: true }));
     } else {
       sendResponse({ error: 'No token provided' });
     }
-    return false;
+    return true;
   }
 
   if (message.type === 'oauthToken') {
     if (message.token) {
-      storeToken(message.token);
-      sendResponse({ success: true });
+      storeToken(message.token).then(() => sendResponse({ success: true }));
+    } else {
+      sendResponse({ success: false });
     }
-    return false;
+    return true;
   }
 
   // ---- EVENT CACHING MESSAGE HANDLERS ----

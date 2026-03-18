@@ -11,7 +11,7 @@
     container.innerHTML =
       '<div class="error">&#10007;</div>' +
       '<h2>Sign-in failed</h2>' +
-      '<p>Error: ' + error + '</p>' +
+      '<p>Error: ' + error.replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])) + '</p>' +
       '<p>You can close this tab and try again.</p>';
     return;
   }
@@ -22,7 +22,7 @@
         container.innerHTML =
           '<div class="error">&#10007;</div>' +
           '<h2>Error</h2>' +
-          '<p>' + chrome.runtime.lastError.message + '</p>' +
+          '<p>' + (chrome.runtime.lastError.message || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]) ) + '</p>' +
           '<p>You can close this tab and try again.</p>';
         return;
       }
