@@ -57,6 +57,10 @@ async function storeToken(token) {
 chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
 chrome.alarms.create('checkToken', { periodInMinutes: 1 });
 chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
+chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
+
+// Track which events we've already notified about so we don't spam
+const notifiedEvents = new Set();
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'refreshEvents') {
@@ -107,6 +111,72 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
   }
 
+  if (alarm.name === 'checkNotifications') {
+    try {
+      const data = await chrome.storage.local.get(['cachedEvents', 'notifPrefs']);
+      const prefs = data.notifPrefs || { enabled: true, minutesBefore: 5 };
+      if (!prefs.enabled) return;
+
+      if (data.cachedEvents && Array.isArray(data.cachedEvents)) {
+        const now = Date.now();
+        const minutesBefore = prefs.minutesBefore || 5;
+        const windowMs = minutesBefore * 60 * 1000;
+
+        const upcoming = data.cachedEvents
+          .filter(event => event.start && event.start.dateTime)
+          .map(event => ({
+            ...event,
+            startMs: new Date(event.start.dateTime).getTime()
+          }))
+          .filter(event => {
+            const timeUntil = event.startMs - now;
+            // Within the notification window but not already past
+            return timeUntil > 0 && timeUntil <= windowMs;
+          });
+
+        upcoming.forEach(event => {
+          const notifKey = `${event.id}-${event.startMs}`;
+          if (notifiedEvents.has(notifKey)) return;
+          notifiedEvents.add(notifKey);
+
+          const minutesUntil = Math.round((event.startMs - now) / 60000);
+          const timeText = minutesUntil <= 1 ? 'Starting now' : `In ${minutesUntil} minutes`;
+          const startTime = new Date(event.start.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+          const endTime = new Date(event.end.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+          const notifOptions = {
+            type: 'basic',
+            iconUrl: 'icons/icon128.png',
+            title: event.summary || '(No title)',
+            message: `${timeText} — ${startTime} to ${endTime}`,
+            priority: 2,
+            requireInteraction: true
+          };
+
+          // Add join button if there's a meet link
+          if (event.hangoutLink) {
+            notifOptions.buttons = [
+              { title: 'Join Meeting' },
+              { title: 'Dismiss' }
+            ];
+          }
+
+          chrome.notifications.create(notifKey, notifOptions);
+        });
+
+        // Clean up old notified events (older than 1 hour)
+        for (const key of notifiedEvents) {
+          const ts = parseInt(key.split('-').pop());
+          if (ts && now - ts > 3600000) {
+            notifiedEvents.delete(key);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[Alarms] checkNotifications error:', e);
+    }
+  }
+
   if (alarm.name === 'updateBadge') {
     // Badge support: show upcoming event info on the extension badge
     try {
@@ -146,6 +216,40 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       console.error('[Alarms] updateBadge error:', e);
     }
   }
+});
+
+// ---- NOTIFICATION HANDLERS ----
+chrome.notifications.onClicked.addListener((notificationId) => {
+  // Find the event's meet link from cached events
+  chrome.storage.local.get(['cachedEvents'], (data) => {
+    if (data.cachedEvents) {
+      const eventId = notificationId.substring(0, notificationId.lastIndexOf('-'));
+      const event = data.cachedEvents.find(e => e.id === eventId);
+      if (event && event.hangoutLink) {
+        chrome.tabs.create({ url: event.hangoutLink });
+      } else if (event && event.htmlLink) {
+        chrome.tabs.create({ url: event.htmlLink });
+      }
+    }
+  });
+  chrome.notifications.clear(notificationId);
+});
+
+chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+  if (buttonIndex === 0) {
+    // "Join Meeting" button
+    chrome.storage.local.get(['cachedEvents'], (data) => {
+      if (data.cachedEvents) {
+        const eventId = notificationId.substring(0, notificationId.lastIndexOf('-'));
+        const event = data.cachedEvents.find(e => e.id === eventId);
+        if (event && event.hangoutLink) {
+          chrome.tabs.create({ url: event.hangoutLink });
+        }
+      }
+    });
+  }
+  // Both buttons dismiss
+  chrome.notifications.clear(notificationId);
 });
 
 // ---- AUTH STRATEGY 1: chrome.identity.getAuthToken() ----
