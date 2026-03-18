@@ -260,16 +260,16 @@
 
         if (res.status === 401) {
           showReAuthBanner();
-          return [];
+          return { items: [], authFailed: true };
         }
-        if (!res.ok) return [];
+        if (!res.ok) return { items: [], authFailed: false };
 
         clearReAuthBanner();
         const data = await res.json();
-        return (data.items || []).map(ev => ({ ...ev, _calendarId: calendarId }));
+        return { items: (data.items || []).map(ev => ({ ...ev, _calendarId: calendarId })), authFailed: false };
       } catch (e) {
         console.error('Fetch error:', e);
-        return [];
+        return { items: [], authFailed: false };
       }
     }
 
@@ -283,9 +283,8 @@
       const results = await Promise.all(
         enabled.map(c => fetchEventsForCalendar(c.id, timeMin, timeMax))
       );
-      let all = results.flat();
-      // If all calendars returned empty and we had auth issues, mark as not ok
-      const hadAuthFailure = all.length === 0 && enabled.length > 0;
+      const hadAuthFailure = results.some(r => r.authFailed);
+      let all = results.flatMap(r => r.items);
       // Filter declined events
       all = all.filter(ev => {
         if (!ev.attendees) return true;
@@ -297,7 +296,7 @@
         const sb = b.start.dateTime ? new Date(b.start.dateTime) : new Date(b.start.date);
         return sa - sb;
       });
-      return { events: all, ok: !hadAuthFailure || all.length > 0 };
+      return { events: all, ok: !hadAuthFailure };
     }
 
     // ---- Helpers ----
@@ -1385,25 +1384,31 @@
       const div = document.createElement('div');
       div.innerHTML = html;
       function walk(node) {
-        for (const child of [...node.children]) {
-          if (!ALLOWED_TAGS.has(child.tagName.toLowerCase())) {
-            child.replaceWith(...child.childNodes);
-            continue;
-          }
-          // Strip all attributes except href on <a>
-          for (const attr of [...child.attributes]) {
-            if (!(child.tagName === 'A' && attr.name === 'href')) {
-              child.removeAttribute(attr.name);
+        // Re-run until stable (handles promoted children from removed parents)
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const child of [...node.children]) {
+            if (!ALLOWED_TAGS.has(child.tagName.toLowerCase())) {
+              child.replaceWith(...child.childNodes);
+              changed = true;
+              break; // Restart scan since DOM changed
             }
+            // Strip all attributes except href on <a>
+            for (const attr of [...child.attributes]) {
+              if (!(child.tagName === 'A' && attr.name === 'href')) {
+                child.removeAttribute(attr.name);
+              }
+            }
+            if (child.tagName === 'A') {
+              try {
+                if (new URL(child.href).protocol !== 'https:') child.removeAttribute('href');
+              } catch { child.removeAttribute('href'); }
+              child.setAttribute('target', '_blank');
+              child.setAttribute('rel', 'noopener noreferrer');
+            }
+            walk(child);
           }
-          if (child.tagName === 'A') {
-            try {
-              if (new URL(child.href).protocol !== 'https:') child.removeAttribute('href');
-            } catch { child.removeAttribute('href'); }
-            child.setAttribute('target', '_blank');
-            child.setAttribute('rel', 'noopener noreferrer');
-          }
-          walk(child);
         }
       }
       walk(div);

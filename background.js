@@ -154,12 +154,18 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
           };
 
           chrome.notifications.create(notifKey, notifOptions);
-
-          // Auto-dismiss after 10 minutes
-          setTimeout(() => {
-            chrome.notifications.clear(notifKey);
-          }, 10 * 60 * 1000);
         }
+
+        // Auto-dismiss notifications for events that started 10+ minutes ago
+        chrome.notifications.getAll((active) => {
+          for (const id of Object.keys(active)) {
+            const parts = id.split('::');
+            const ts = parseInt(parts[parts.length - 1]);
+            if (ts && now - ts > 10 * 60 * 1000) {
+              chrome.notifications.clear(id);
+            }
+          }
+        });
 
         // Clean up old notified keys (older than 1 hour)
         for (const key of notifiedKeys) {
@@ -417,15 +423,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         const redirectUri = getRedirectURL();
         const authUrl = buildAuthURL(redirectUri, { silent: true });
+        let responded = false;
 
         const timeout = setTimeout(() => {
-          sendResponse({ token: null });
+          if (!responded) { responded = true; sendResponse({ token: null }); }
         }, 10000);
 
         chrome.identity.launchWebAuthFlow(
           { url: authUrl, interactive: false },
           (responseUrl) => {
             clearTimeout(timeout);
+            if (responded) return;
+            responded = true;
             if (chrome.runtime.lastError || !responseUrl) {
               sendResponse({ token: null });
               return;
@@ -519,20 +528,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'saveManualToken') {
     if (message.token) {
-      storeToken(message.token);
-      sendResponse({ success: true });
+      storeToken(message.token).then(() => sendResponse({ success: true }));
     } else {
       sendResponse({ error: 'No token provided' });
     }
-    return false;
+    return true;
   }
 
   if (message.type === 'oauthToken') {
     if (message.token) {
-      storeToken(message.token);
-      sendResponse({ success: true });
+      storeToken(message.token).then(() => sendResponse({ success: true }));
+    } else {
+      sendResponse({ success: false });
     }
-    return false;
+    return true;
   }
 
   // ---- EVENT CACHING MESSAGE HANDLERS ----
