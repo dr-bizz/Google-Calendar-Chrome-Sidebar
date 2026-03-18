@@ -111,12 +111,33 @@
     // ---- API ----
     async function fetchCalendarList() {
       if (!authToken) return [];
-      try {
-        const res = await fetch(
+
+      const doFetch = async () => {
+        return await fetch(
           'https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader',
           { headers: { Authorization: `Bearer ${authToken}` } }
         );
+      };
+
+      try {
+        let res = await doFetch();
+
+        // On 401, try re-auth then retry
+        if (res.status === 401) {
+          const refreshed = await tryReAuth();
+          if (refreshed) {
+            res = await doFetch();
+          }
+        }
+
+        if (res.status === 401) {
+          showReAuthBanner();
+          return allCalendars.length ? allCalendars : [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
+        }
+
         if (!res.ok) return [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
+
+        clearReAuthBanner();
         const data = await res.json();
         const cals = (data.items || []).filter(c => c.selected !== false);
         allCalendars = cals.map(c => ({
@@ -125,7 +146,6 @@
           backgroundColor: c.backgroundColor || '#1a73e8',
           primary: c.primary || false
         }));
-        // If no saved filter, default to primary calendar only
         if (!enabledCalendarIds) {
           const primary = allCalendars.find(c => c.primary);
           if (primary) {
@@ -137,21 +157,73 @@
         }
         return allCalendars;
       } catch (e) {
-        return [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
+        return allCalendars.length ? allCalendars : [{ id: 'primary', summary: 'Primary', backgroundColor: '#1a73e8' }];
       }
     }
 
-    let reAuthAttempted = false;
+    let reAuthInProgress = false;
 
-    async function silentReAuth() {
-      console.log('[Auth] Attempting silent re-auth...');
-      const result = await sendMsg({ type: 'startAuth' });
-      if (result && result.token) {
-        authToken = result.token;
-        console.log('[Auth] Silent re-auth succeeded');
-        return true;
+    async function tryReAuth() {
+      if (reAuthInProgress) return false;
+      reAuthInProgress = true;
+
+      try {
+        // Step 1: Try non-interactive refresh (no popup)
+        console.log('[Auth] Attempting silent (non-interactive) refresh...');
+        const silent = await sendMsg({ type: 'silentRefresh' });
+        if (silent && silent.token) {
+          authToken = silent.token;
+          console.log('[Auth] Silent refresh succeeded');
+          return true;
+        }
+
+        // Step 2: Check if another tab already refreshed the token
+        const stored = await sendMsg({ type: 'getStoredToken' });
+        if (stored && stored.token && stored.token !== authToken) {
+          authToken = stored.token;
+          console.log('[Auth] Picked up token refreshed by another tab');
+          return true;
+        }
+
+        // Step 3: Silent failed
+        console.log('[Auth] Silent refresh failed, showing re-auth banner');
+        return false;
+      } finally {
+        reAuthInProgress = false;
       }
-      return false;
+    }
+
+    function showReAuthBanner() {
+      const c = document.getElementById('meetingWarningContainer');
+      if (!c) return;
+      // Don't stack multiple banners
+      if (document.getElementById('reAuthBanner')) return;
+      c.innerHTML = `<div class="meeting-warning" style="cursor:pointer;" id="reAuthBanner">
+        <div class="meeting-warning-text" style="color:var(--primary);">Session expired — tap here to reconnect</div>
+      </div>`;
+      document.getElementById('reAuthBanner').addEventListener('click', async () => {
+        c.innerHTML = `<div class="meeting-warning">
+          <div class="meeting-warning-text" style="color:var(--text-secondary);">Reconnecting...</div>
+        </div>`;
+        const result = await sendMsg({ type: 'startAuth' });
+        if (result && result.token) {
+          authToken = result.token;
+          c.innerHTML = '';
+          loadEvents();
+        } else {
+          authToken = null;
+          showScreen('authScreen');
+          showError('authError', 'Session expired. Please sign in again.');
+        }
+      });
+    }
+
+    function clearReAuthBanner() {
+      const banner = document.getElementById('reAuthBanner');
+      if (banner) {
+        const container = banner.closest('.meeting-warning');
+        if (container) container.remove();
+      }
     }
 
     async function fetchEventsForCalendar(calendarId, timeMin, timeMax) {
@@ -175,23 +247,21 @@
       try {
         let res = await doFetch();
 
-        // On 401, try silent re-auth once before giving up
-        if (res.status === 401 && !reAuthAttempted) {
-          reAuthAttempted = true;
-          const refreshed = await silentReAuth();
+        // On 401, try re-auth then retry
+        if (res.status === 401) {
+          const refreshed = await tryReAuth();
           if (refreshed) {
             res = await doFetch();
           }
         }
 
         if (res.status === 401) {
-          authToken = null;
-          showScreen('authScreen');
-          showError('authError', 'Session expired. Please sign in again.');
+          showReAuthBanner();
           return [];
         }
         if (!res.ok) return [];
-        reAuthAttempted = false; // reset on success
+
+        clearReAuthBanner();
         const data = await res.json();
         return (data.items || []).map(ev => ({ ...ev, _calendarId: calendarId }));
       } catch (e) {
@@ -1348,15 +1418,16 @@
     async function loadEvents() {
       const now = new Date(), tMin = new Date(now), tMax = new Date(now);
       tMin.setHours(0, 0, 0, 0); tMax.setDate(tMax.getDate() + 14);
-      events = await fetchAllEvents(tMin, tMax);
+      const fetched = await fetchAllEvents(tMin, tMax);
 
-      // If token was lost during fetch, don't render — auth screen is already showing
-      if (!authToken) return;
+      // Only replace events if we got results (keep cached data on auth failure)
+      if (fetched.length > 0) {
+        events = fetched;
+        cacheEventsToStorage(events);
+      }
 
-      // Cache for badge/offline use
-      if (events.length) cacheEventsToStorage(events);
+      // Always render what we have (cached or fresh)
       renderAll();
-      // Start meeting warning check every 30s
       clearInterval(warningInterval);
       warningInterval = setInterval(renderMeetingWarning, 30000);
     }
@@ -1606,6 +1677,45 @@
         }
       }
     }, 2000);
+
+    // ---- Cross-tab token sync ----
+    // When any tab refreshes the token, all other tabs pick it up immediately
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+
+      if (changes.accessToken) {
+        const newToken = changes.accessToken.newValue;
+        const oldToken = authToken;
+
+        if (newToken && newToken !== oldToken) {
+          // Another tab refreshed the token — use it
+          console.log('[Sync] Token updated from another tab');
+          authToken = newToken;
+
+          // Clear any re-auth banner
+          clearReAuthBanner();
+
+          // If we're on the auth screen, switch to main and load
+          const authScreen = document.getElementById('authScreen');
+          if (authScreen && authScreen.style.display !== 'none') {
+            showScreen('loadingScreen');
+            loadEvents().then(() => {
+              showScreen('mainContent');
+              if (!refreshInterval) {
+                refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
+              }
+            });
+          }
+        } else if (!newToken && oldToken) {
+          // Token was cleared (sign out from another tab)
+          console.log('[Sync] Token cleared from another tab');
+          authToken = null;
+          clearAllIntervals();
+          events = [];
+          showScreen('authScreen');
+        }
+      }
+    });
 
     // Start
     init();

@@ -301,6 +301,40 @@ async function authViaTab() {
 // ---- MESSAGE HANDLING ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
+  // Silent token refresh — non-interactive, no popup
+  if (message.type === 'silentRefresh') {
+    (async () => {
+      console.log('[Auth] Attempting silent (non-interactive) refresh...');
+      try {
+        const redirectUri = getRedirectURL();
+        const authUrl = buildAuthURL(redirectUri);
+
+        chrome.identity.launchWebAuthFlow(
+          { url: authUrl, interactive: false },
+          (responseUrl) => {
+            if (chrome.runtime.lastError || !responseUrl) {
+              console.log('[Auth] Silent refresh failed:', chrome.runtime.lastError?.message || 'no response');
+              sendResponse({ token: null });
+              return;
+            }
+            const token = extractTokenFromUrl(responseUrl);
+            if (token) {
+              console.log('[Auth] Silent refresh succeeded');
+              storeToken(token);
+              sendResponse({ token });
+            } else {
+              sendResponse({ token: null });
+            }
+          }
+        );
+      } catch (e) {
+        console.log('[Auth] Silent refresh error:', e.message);
+        sendResponse({ token: null });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'startAuth') {
     (async () => {
       console.log('[Auth] Starting authentication...');
