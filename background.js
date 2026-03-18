@@ -22,16 +22,20 @@ function getRedirectURL() {
   }
 }
 
-function buildAuthURL(redirectUri) {
+function buildAuthURL(redirectUri, { silent = false } = {}) {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: 'token',
     redirect_uri: redirectUri,
     scope: SCOPES,
-    prompt: 'select_account',
     access_type: 'online'
   });
+  if (!silent) params.set('prompt', 'select_account');
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+function isSafeUrl(url) {
+  try { return new URL(url).protocol === 'https:'; } catch { return false; }
 }
 
 function extractTokenFromUrl(url) {
@@ -54,13 +58,13 @@ async function storeToken(token) {
 }
 
 // ---- ALARMS SETUP ----
-chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
-chrome.alarms.create('checkToken', { periodInMinutes: 1 });
-chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
-chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
-
-// Track which events we've already notified about so we don't spam
-const notifiedEvents = new Set();
+// Create alarms on install/update to avoid resetting timers on every worker wake
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
+  chrome.alarms.create('checkToken', { periodInMinutes: 1 });
+  chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
+  chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
+});
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'refreshEvents') {
@@ -78,14 +82,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
           console.log('[Alarms] Token is older than 45 minutes, attempting silent re-auth');
           try {
             const redirectUri = getRedirectURL();
-            const params = new URLSearchParams({
-              client_id: CLIENT_ID,
-              response_type: 'token',
-              redirect_uri: redirectUri,
-              scope: SCOPES,
-              access_type: 'online'
-            });
-            const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+            const authUrl = buildAuthURL(redirectUri, { silent: true });
 
             chrome.identity.launchWebAuthFlow(
               { url: authUrl, interactive: false },
@@ -113,33 +110,36 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
   if (alarm.name === 'checkNotifications') {
     try {
-      const data = await chrome.storage.local.get(['cachedEvents', 'notifPrefs']);
+      const data = await chrome.storage.local.get(['cachedEvents', 'notifPrefs', 'notifiedEventKeys']);
       const prefs = data.notifPrefs || { enabled: true, minutesBefore: 5 };
       if (!prefs.enabled) return;
+
+      // Load persisted notification tracking (survives service worker termination)
+      const notifiedKeys = new Set(data.notifiedEventKeys || []);
 
       if (data.cachedEvents && Array.isArray(data.cachedEvents)) {
         const now = Date.now();
         const minutesBefore = prefs.minutesBefore || 5;
         const windowMs = minutesBefore * 60 * 1000;
+        let changed = false;
 
-        const upcoming = data.cachedEvents
-          .filter(event => event.start && event.start.dateTime)
-          .map(event => ({
-            ...event,
-            startMs: new Date(event.start.dateTime).getTime()
-          }))
-          .filter(event => {
-            const timeUntil = event.startMs - now;
-            // Within the notification window but not already past
-            return timeUntil > 0 && timeUntil <= windowMs;
-          });
+        const upcoming = [];
+        for (const event of data.cachedEvents) {
+          if (!event.start || !event.start.dateTime || !event.end || !event.end.dateTime) continue;
+          const startMs = new Date(event.start.dateTime).getTime();
+          const timeUntil = startMs - now;
+          if (timeUntil > 0 && timeUntil <= windowMs) {
+            upcoming.push({ event, startMs });
+          }
+        }
 
-        upcoming.forEach(event => {
-          const notifKey = `${event.id}-${event.startMs}`;
-          if (notifiedEvents.has(notifKey)) return;
-          notifiedEvents.add(notifKey);
+        for (const { event, startMs } of upcoming) {
+          const notifKey = `${event.id}::${startMs}`;
+          if (notifiedKeys.has(notifKey)) continue;
+          notifiedKeys.add(notifKey);
+          changed = true;
 
-          const minutesUntil = Math.round((event.startMs - now) / 60000);
+          const minutesUntil = Math.round((startMs - now) / 60000);
           const timeText = minutesUntil <= 1 ? 'Starting now' : `In ${minutesUntil} minutes`;
           const startTime = new Date(event.start.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
           const endTime = new Date(event.end.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -150,26 +150,30 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             title: event.summary || '(No title)',
             message: `${timeText} — ${startTime} to ${endTime}`,
             priority: 2,
-            requireInteraction: true
+            requireInteraction: minutesUntil <= 2
           };
 
-          // Add join button if there's a meet link
-          if (event.hangoutLink) {
-            notifOptions.buttons = [
-              { title: 'Join Meeting' },
-              { title: 'Dismiss' }
-            ];
-          }
-
           chrome.notifications.create(notifKey, notifOptions);
-        });
 
-        // Clean up old notified events (older than 1 hour)
-        for (const key of notifiedEvents) {
-          const ts = parseInt(key.split('-').pop());
+          // Auto-dismiss after 10 minutes
+          setTimeout(() => {
+            chrome.notifications.clear(notifKey);
+          }, 10 * 60 * 1000);
+        }
+
+        // Clean up old notified keys (older than 1 hour)
+        for (const key of notifiedKeys) {
+          const parts = key.split('::');
+          const ts = parseInt(parts[parts.length - 1]);
           if (ts && now - ts > 3600000) {
-            notifiedEvents.delete(key);
+            notifiedKeys.delete(key);
+            changed = true;
           }
+        }
+
+        // Persist tracking to survive service worker termination
+        if (changed) {
+          await chrome.storage.local.set({ notifiedEventKeys: [...notifiedKeys] });
         }
       }
     } catch (e) {
@@ -219,36 +223,38 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 });
 
 // ---- NOTIFICATION HANDLERS ----
-chrome.notifications.onClicked.addListener((notificationId) => {
-  // Find the event's meet link from cached events
+function findEventFromNotification(notificationId, callback) {
   chrome.storage.local.get(['cachedEvents'], (data) => {
-    if (data.cachedEvents) {
-      const eventId = notificationId.substring(0, notificationId.lastIndexOf('-'));
-      const event = data.cachedEvents.find(e => e.id === eventId);
-      if (event && event.hangoutLink) {
-        chrome.tabs.create({ url: event.hangoutLink });
-      } else if (event && event.htmlLink) {
-        chrome.tabs.create({ url: event.htmlLink });
-      }
-    }
+    if (!data.cachedEvents) { callback(null); return; }
+    const delimIdx = notificationId.lastIndexOf('::');
+    const eventId = delimIdx !== -1 ? notificationId.substring(0, delimIdx) : notificationId;
+    const event = data.cachedEvents.find(e => e.id === eventId);
+    callback(event || null);
+  });
+}
+
+function openEventUrl(event) {
+  const url = event.hangoutLink || event.htmlLink;
+  if (url && isSafeUrl(url)) {
+    chrome.tabs.create({ url });
+  }
+}
+
+chrome.notifications.onClicked.addListener((notificationId) => {
+  findEventFromNotification(notificationId, (event) => {
+    if (event) openEventUrl(event);
   });
   chrome.notifications.clear(notificationId);
 });
 
 chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
   if (buttonIndex === 0) {
-    // "Join Meeting" button
-    chrome.storage.local.get(['cachedEvents'], (data) => {
-      if (data.cachedEvents) {
-        const eventId = notificationId.substring(0, notificationId.lastIndexOf('-'));
-        const event = data.cachedEvents.find(e => e.id === eventId);
-        if (event && event.hangoutLink) {
-          chrome.tabs.create({ url: event.hangoutLink });
-        }
+    findEventFromNotification(notificationId, (event) => {
+      if (event && event.hangoutLink && isSafeUrl(event.hangoutLink)) {
+        chrome.tabs.create({ url: event.hangoutLink });
       }
     });
   }
-  // Both buttons dismiss
   chrome.notifications.clear(notificationId);
 });
 
@@ -405,34 +411,34 @@ async function authViaTab() {
 // ---- MESSAGE HANDLING ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
-  // Silent token refresh — non-interactive, no popup
+  // Silent token refresh — non-interactive, no popup, with timeout
   if (message.type === 'silentRefresh') {
     (async () => {
-      console.log('[Auth] Attempting silent (non-interactive) refresh...');
       try {
         const redirectUri = getRedirectURL();
-        const authUrl = buildAuthURL(redirectUri);
+        const authUrl = buildAuthURL(redirectUri, { silent: true });
+
+        const timeout = setTimeout(() => {
+          sendResponse({ token: null });
+        }, 10000);
 
         chrome.identity.launchWebAuthFlow(
           { url: authUrl, interactive: false },
           (responseUrl) => {
+            clearTimeout(timeout);
             if (chrome.runtime.lastError || !responseUrl) {
-              console.log('[Auth] Silent refresh failed:', chrome.runtime.lastError?.message || 'no response');
               sendResponse({ token: null });
               return;
             }
             const token = extractTokenFromUrl(responseUrl);
             if (token) {
-              console.log('[Auth] Silent refresh succeeded');
-              storeToken(token);
-              sendResponse({ token });
+              storeToken(token).then(() => sendResponse({ token }));
             } else {
               sendResponse({ token: null });
             }
           }
         );
       } catch (e) {
-        console.log('[Auth] Silent refresh error:', e.message);
         sendResponse({ token: null });
       }
     })();

@@ -8,7 +8,6 @@
     let selectedDate = null; // clicked date in mini calendar
     let refreshInterval = null;
     let countdownInterval = null;
-    let tokenPollInterval = null;
     let showUpcoming = false;
     let miniCalCollapsed = false;
     let compactMode = false;
@@ -161,51 +160,58 @@
       }
     }
 
-    let reAuthInProgress = false;
+    let reAuthPromise = null;
 
     async function tryReAuth() {
-      if (reAuthInProgress) return false;
-      reAuthInProgress = true;
+      // If a re-auth is already in flight, await the same result
+      if (reAuthPromise) return reAuthPromise;
 
-      try {
-        // Step 1: Try non-interactive refresh (no popup)
-        console.log('[Auth] Attempting silent (non-interactive) refresh...');
-        const silent = await sendMsg({ type: 'silentRefresh' });
-        if (silent && silent.token) {
-          authToken = silent.token;
-          console.log('[Auth] Silent refresh succeeded');
-          return true;
+      reAuthPromise = (async () => {
+        try {
+          // Step 1: Try non-interactive refresh (no popup)
+          const silent = await sendMsg({ type: 'silentRefresh' });
+          if (silent && silent.token) {
+            authToken = silent.token;
+            return true;
+          }
+
+          // Step 2: Check if another tab already refreshed the token
+          const stored = await sendMsg({ type: 'getStoredToken' });
+          if (stored && stored.token && stored.token !== authToken) {
+            authToken = stored.token;
+            return true;
+          }
+
+          // Step 3: Silent failed
+          return false;
+        } finally {
+          reAuthPromise = null;
         }
+      })();
 
-        // Step 2: Check if another tab already refreshed the token
-        const stored = await sendMsg({ type: 'getStoredToken' });
-        if (stored && stored.token && stored.token !== authToken) {
-          authToken = stored.token;
-          console.log('[Auth] Picked up token refreshed by another tab');
-          return true;
-        }
-
-        // Step 3: Silent failed
-        console.log('[Auth] Silent refresh failed, showing re-auth banner');
-        return false;
-      } finally {
-        reAuthInProgress = false;
-      }
+      return reAuthPromise;
     }
 
     function showReAuthBanner() {
-      const c = document.getElementById('meetingWarningContainer');
+      const c = document.getElementById('reAuthContainer');
       if (!c) return;
-      // Don't stack multiple banners
       if (document.getElementById('reAuthBanner')) return;
-      c.innerHTML = `<div class="meeting-warning" style="cursor:pointer;" id="reAuthBanner">
-        <div class="meeting-warning-text" style="color:var(--primary);">Session expired — tap here to reconnect</div>
+      c.innerHTML = `<div class="session-banner" id="reAuthBanner">
+        <div class="session-banner-text">Session expired — click here to reconnect</div>
       </div>`;
       document.getElementById('reAuthBanner').addEventListener('click', async () => {
-        c.innerHTML = `<div class="meeting-warning">
-          <div class="meeting-warning-text" style="color:var(--text-secondary);">Reconnecting...</div>
+        c.innerHTML = `<div class="session-banner">
+          <div class="session-banner-text" style="color:var(--text-secondary);">Reconnecting...</div>
         </div>`;
+        // Timeout after 30 seconds
+        const timeout = setTimeout(() => {
+          c.innerHTML = `<div class="session-banner" id="reAuthBanner">
+            <div class="session-banner-text">Reconnection timed out — click to try again</div>
+          </div>`;
+          showReAuthBanner(); // Re-attach click listener
+        }, 30000);
         const result = await sendMsg({ type: 'startAuth' });
+        clearTimeout(timeout);
         if (result && result.token) {
           authToken = result.token;
           c.innerHTML = '';
@@ -219,11 +225,8 @@
     }
 
     function clearReAuthBanner() {
-      const banner = document.getElementById('reAuthBanner');
-      if (banner) {
-        const container = banner.closest('.meeting-warning');
-        if (container) container.remove();
-      }
+      const c = document.getElementById('reAuthContainer');
+      if (c) c.innerHTML = '';
     }
 
     async function fetchEventsForCalendar(calendarId, timeMin, timeMax) {
@@ -272,29 +275,29 @@
 
     async function fetchAllEvents(timeMin, timeMax) {
       const calendars = await fetchCalendarList();
-      if (!calendars.length) return [];
-      // Only fetch enabled calendars
+      if (!calendars.length) return { events: [], ok: false };
       const enabled = enabledCalendarIds
         ? calendars.filter(c => enabledCalendarIds.has(c.id))
         : calendars;
-      if (!enabled.length) return [];
+      if (!enabled.length) return { events: [], ok: true };
       const results = await Promise.all(
         enabled.map(c => fetchEventsForCalendar(c.id, timeMin, timeMax))
       );
       let all = results.flat();
+      // If all calendars returned empty and we had auth issues, mark as not ok
+      const hadAuthFailure = all.length === 0 && enabled.length > 0;
       // Filter declined events
       all = all.filter(ev => {
         if (!ev.attendees) return true;
         const me = ev.attendees.find(a => a.self);
         return !me || me.responseStatus !== 'declined';
       });
-      // Sort by start time
       all.sort((a, b) => {
         const sa = a.start.dateTime ? new Date(a.start.dateTime) : new Date(a.start.date);
         const sb = b.start.dateTime ? new Date(b.start.dateTime) : new Date(b.start.date);
         return sa - sb;
       });
-      return all;
+      return { events: all, ok: !hadAuthFailure || all.length > 0 };
     }
 
     // ---- Helpers ----
@@ -1377,15 +1380,33 @@
     }
 
     function sanitizeDescription(html) {
-      // Allow basic formatting but strip scripts
+      // Allowlist-based sanitizer — only safe tags and attributes
+      const ALLOWED_TAGS = new Set(['p','br','b','i','strong','em','a','ul','ol','li','div','span']);
       const div = document.createElement('div');
       div.innerHTML = html;
-      div.querySelectorAll('script,style,iframe,object,embed').forEach(el => el.remove());
-      // Make links open in new tab
-      div.querySelectorAll('a').forEach(a => {
-        a.setAttribute('target', '_blank');
-        a.setAttribute('rel', 'noopener noreferrer');
-      });
+      function walk(node) {
+        for (const child of [...node.children]) {
+          if (!ALLOWED_TAGS.has(child.tagName.toLowerCase())) {
+            child.replaceWith(...child.childNodes);
+            continue;
+          }
+          // Strip all attributes except href on <a>
+          for (const attr of [...child.attributes]) {
+            if (!(child.tagName === 'A' && attr.name === 'href')) {
+              child.removeAttribute(attr.name);
+            }
+          }
+          if (child.tagName === 'A') {
+            try {
+              if (new URL(child.href).protocol !== 'https:') child.removeAttribute('href');
+            } catch { child.removeAttribute('href'); }
+            child.setAttribute('target', '_blank');
+            child.setAttribute('rel', 'noopener noreferrer');
+          }
+          walk(child);
+        }
+      }
+      walk(div);
       return div.innerHTML;
     }
 
@@ -1418,15 +1439,15 @@
     async function loadEvents() {
       const now = new Date(), tMin = new Date(now), tMax = new Date(now);
       tMin.setHours(0, 0, 0, 0); tMax.setDate(tMax.getDate() + 14);
-      const fetched = await fetchAllEvents(tMin, tMax);
+      const result = await fetchAllEvents(tMin, tMax);
 
-      // Only replace events if we got results (keep cached data on auth failure)
-      if (fetched.length > 0) {
-        events = fetched;
-        cacheEventsToStorage(events);
+      if (result.ok) {
+        // Successful fetch — update events (even if empty = genuinely empty calendar)
+        events = result.events;
+        if (events.length) cacheEventsToStorage(events);
       }
+      // On failure, keep cached events but they may be stale
 
-      // Always render what we have (cached or fresh)
       renderAll();
       clearInterval(warningInterval);
       warningInterval = setInterval(renderMeetingWarning, 30000);
@@ -1443,11 +1464,9 @@
     function clearAllIntervals() {
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
-      clearInterval(tokenPollInterval);
       clearInterval(warningInterval);
       refreshInterval = null;
       countdownInterval = null;
-      tokenPollInterval = null;
       warningInterval = null;
     }
 
@@ -1664,22 +1683,8 @@
       savePrefs();
     });
 
-    // Token polling (with proper cleanup)
-    tokenPollInterval = setInterval(async () => {
-      if (!authToken) {
-        const stored = await sendMsg({ type: 'getStoredToken' });
-        if (stored && stored.token) {
-          authToken = stored.token;
-          showScreen('loadingScreen');
-          await loadEvents();
-          showScreen('mainContent');
-          refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
-        }
-      }
-    }, 2000);
-
     // ---- Cross-tab token sync ----
-    // When any tab refreshes the token, all other tabs pick it up immediately
+    // Replaces token polling — reacts instantly to storage changes from any tab
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
 
@@ -1688,16 +1693,12 @@
         const oldToken = authToken;
 
         if (newToken && newToken !== oldToken) {
-          // Another tab refreshed the token — use it
-          console.log('[Sync] Token updated from another tab');
           authToken = newToken;
-
-          // Clear any re-auth banner
           clearReAuthBanner();
 
           // If we're on the auth screen, switch to main and load
-          const authScreen = document.getElementById('authScreen');
-          if (authScreen && authScreen.style.display !== 'none') {
+          const authScreenEl = document.getElementById('authScreen');
+          if (authScreenEl && authScreenEl.style.display !== 'none') {
             showScreen('loadingScreen');
             loadEvents().then(() => {
               showScreen('mainContent');
@@ -1708,10 +1709,10 @@
           }
         } else if (!newToken && oldToken) {
           // Token was cleared (sign out from another tab)
-          console.log('[Sync] Token cleared from another tab');
           authToken = null;
           clearAllIntervals();
           events = [];
+          showToast('Signed out from another tab');
           showScreen('authScreen');
         }
       }

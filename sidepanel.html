@@ -340,6 +340,11 @@
     .meeting-warning-action { font-size: 11px; color: var(--primary); text-decoration: none; font-weight: 500; white-space: nowrap; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
 
+    /* ---- Session re-auth banner ---- */
+    .session-banner { margin: 0 12px 8px; padding: 8px 12px; background: var(--primary-light); border-radius: 6px; border-left: 3px solid var(--primary); display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .session-banner:hover { background: var(--hover-bg); }
+    .session-banner-text { font-size: 12px; font-weight: 600; color: var(--primary); flex: 1; }
+
     /* ---- Full-screen meeting alert overlay ---- */
     .meeting-alert-overlay {
       position: fixed; inset: 0; z-index: 9999;
@@ -782,6 +787,7 @@
     <div class="mini-cal-toggle" id="miniCalToggle">Hide calendar ▴</div>
     <div class="cal-filter" id="calFilterPanel"><div class="cal-filter-inner" id="calFilterList"></div></div>
     <div id="daySummaryContainer" class="day-summary-panel"></div>
+    <div id="reAuthContainer"></div>
     <div id="meetingWarningContainer"></div>
     <div id="nextMeetingContainer"></div>
     <div id="timelineContainer"></div>
