@@ -2,6 +2,11 @@
 const CLIENT_ID = '213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly';
 
+// ---- GITHUB CONFIG ----
+const GITHUB_CLIENT_ID = 'YOUR_GITHUB_CLIENT_ID';
+const GITHUB_WORKER_URL = 'https://github-token-exchange.YOUR_SUBDOMAIN.workers.dev';
+const GITHUB_SCOPE = 'repo';
+
 // ---- SIDE PANEL SETUP ----
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
@@ -414,6 +419,83 @@ async function authViaTab() {
   });
 }
 
+// ---- GITHUB AUTH ----
+async function authViaGitHub() {
+  return new Promise((resolve) => {
+    const redirectUri = getRedirectURL();
+    const state = crypto.randomUUID();
+    const params = new URLSearchParams({
+      client_id: GITHUB_CLIENT_ID,
+      redirect_uri: redirectUri,
+      scope: GITHUB_SCOPE,
+      state,
+    });
+    const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+
+    console.log('[GitHub Auth] Starting OAuth flow');
+    console.log('[GitHub Auth] Redirect URI:', redirectUri);
+
+    try {
+      chrome.identity.launchWebAuthFlow(
+        { url: authUrl, interactive: true },
+        async (responseUrl) => {
+          if (chrome.runtime.lastError || !responseUrl) {
+            console.warn('[GitHub Auth] Failed:', chrome.runtime.lastError?.message);
+            resolve({ error: chrome.runtime.lastError?.message || 'No response' });
+            return;
+          }
+
+          try {
+            const url = new URL(responseUrl);
+            const code = url.searchParams.get('code');
+            const returnedState = url.searchParams.get('state');
+
+            if (!code) {
+              resolve({ error: 'No authorization code in response' });
+              return;
+            }
+
+            if (returnedState !== state) {
+              resolve({ error: 'State mismatch — possible CSRF attack' });
+              return;
+            }
+
+            // Exchange code for token via Cloudflare Worker
+            const tokenResponse = await fetch(`${GITHUB_WORKER_URL}/github/token`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ code }),
+            });
+
+            const data = await tokenResponse.json();
+            if (data.error) {
+              resolve({ error: data.error });
+              return;
+            }
+
+            if (data.access_token) {
+              console.log('[GitHub Auth] Success!');
+              await chrome.storage.local.set({
+                githubToken: data.access_token,
+                githubTokenTime: Date.now(),
+              });
+              resolve({ token: data.access_token });
+            } else {
+              resolve({ error: 'No access token in worker response' });
+            }
+          } catch (e) {
+            console.error('[GitHub Auth] Token exchange error:', e);
+            resolve({ error: e.message });
+          }
+        }
+      );
+    } catch (e) {
+      console.warn('[GitHub Auth] Exception:', e.message);
+      resolve({ error: e.message });
+    }
+  });
+}
+
 // ---- MESSAGE HANDLING ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
@@ -560,6 +642,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({
         events: data.cachedEvents || null,
         cacheTime: data.cacheTime || null
+      });
+    });
+    return true;
+  }
+
+  // ---- GITHUB AUTH MESSAGE HANDLERS ----
+  if (message.type === 'startGitHubAuth') {
+    (async () => {
+      const result = await authViaGitHub();
+      sendResponse(result);
+    })();
+    return true;
+  }
+
+  if (message.type === 'getGitHubToken') {
+    chrome.storage.local.get(['githubToken'], (data) => {
+      sendResponse({ token: data.githubToken || null });
+    });
+    return true;
+  }
+
+  if (message.type === 'disconnectGitHub') {
+    chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'githubUsername'], () => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  // ---- PR CACHING MESSAGE HANDLERS ----
+  if (message.type === 'cachePRs') {
+    chrome.storage.local.set({
+      cachedPRs: message.prs,
+      prCacheTime: Date.now(),
+    }, () => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  if (message.type === 'getCachedPRs') {
+    chrome.storage.local.get(['cachedPRs', 'prCacheTime'], (data) => {
+      sendResponse({
+        prs: data.cachedPRs || null,
+        cacheTime: data.prCacheTime || null,
       });
     });
     return true;
