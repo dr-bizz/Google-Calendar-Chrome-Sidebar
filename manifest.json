@@ -14,7 +14,9 @@
   ],
   "host_permissions": [
     "https://www.googleapis.com/*",
-    "https://accounts.google.com/*"
+    "https://accounts.google.com/*",
+    "https://api.github.com/*",
+    "https://github-token-exchange.dr-bizz.workers.dev/*"
   ],
   "oauth2": {
     "client_id": "213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com",

@@ -13,6 +13,18 @@
     let compactMode = false;
     let darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
 
+    // ---- GitHub PR State ----
+    let githubToken = null;
+    let githubUsername = null;
+    let prReviews = [];
+    let prSectionCollapsed = false;
+    let prSettingsOpen = false;
+    let prLoading = false;
+    let prError = null;
+    let enabledPRRepos = null; // null = show all, Set once loaded
+    let prPollInterval = null;
+    let prConsecutiveFailures = 0;
+
     const CALENDAR_COLORS = {
       '1':'#7986cb','2':'#33b679','3':'#8e24aa','4':'#e67c73',
       '5':'#f6bf26','6':'#f4511e','7':'#039be5','8':'#616161',
@@ -29,6 +41,7 @@
           if (p.compactMode !== undefined) compactMode = p.compactMode;
           if (p.miniCalCollapsed !== undefined) miniCalCollapsed = p.miniCalCollapsed;
           if (p.enabledCalendarIds) enabledCalendarIds = new Set(p.enabledCalendarIds);
+          if (p.prSectionCollapsed !== undefined) prSectionCollapsed = p.prSectionCollapsed;
         }
       } catch (e) {}
       applyPrefs();
@@ -36,7 +49,7 @@
     function savePrefs() {
       try {
         localStorage.setItem('calPrefs', JSON.stringify({
-          darkMode, compactMode, miniCalCollapsed,
+          darkMode, compactMode, miniCalCollapsed, prSectionCollapsed,
           enabledCalendarIds: enabledCalendarIds ? [...enabledCalendarIds] : null
         }));
       } catch (e) {}
@@ -350,6 +363,201 @@
         }
       } catch (e) {}
       return null;
+    }
+
+    // ---- GitHub PR API ----
+    async function githubFetch(url) {
+      if (!githubToken) return { ok: false, status: 0 };
+      try {
+        const response = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${githubToken}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+          },
+        });
+        if (response.status === 401) {
+          githubToken = null;
+          githubUsername = null;
+          prReviews = [];
+          enabledPRRepos = null;
+          clearInterval(prPollInterval);
+          prPollInterval = null;
+          await chrome.runtime.sendMessage({ type: 'disconnectGitHub' });
+          renderPRSection();
+          updatePRToolbarBadge();
+          return { ok: false, status: 401 };
+        }
+        if (!response.ok) return { ok: false, status: response.status, headers: response.headers };
+        const data = await response.json();
+        return { ok: true, data, headers: response.headers };
+      } catch (e) {
+        return { ok: false, status: 0 };
+      }
+    }
+
+    async function validateGitHubToken() {
+      const result = await githubFetch('https://api.github.com/user');
+      if (result.ok) {
+        githubUsername = result.data.login;
+        await chrome.storage.local.set({ githubUsername: githubUsername });
+        return true;
+      }
+      return false;
+    }
+
+    async function fetchPRReviews() {
+      if (!githubToken || !githubUsername) return;
+      prLoading = true;
+      prError = null;
+      renderPRSection();
+
+      try {
+        // Check deduplication
+        const cached = await chrome.runtime.sendMessage({ type: 'getCachedPRs' });
+        if (cached && cached.cacheTime && Date.now() - cached.cacheTime < 90000) {
+          if (cached.prs) prReviews = cached.prs;
+          prLoading = false;
+          renderPRSection();
+          return;
+        }
+
+        // Search for PRs requesting review
+        const searchResult = await githubFetch(
+          `https://api.github.com/search/issues?q=type:pr+review-requested:${encodeURIComponent(githubUsername)}+is:open&per_page=100`
+        );
+
+        if (searchResult.status === 403) {
+          prConsecutiveFailures++;
+          if (prConsecutiveFailures >= 3) {
+            prError = 'GitHub rate limit exceeded. Try again later.';
+          }
+          prLoading = false;
+          renderPRSection();
+          return;
+        }
+
+        if (!searchResult.ok) {
+          prConsecutiveFailures++;
+          if (prConsecutiveFailures >= 3) {
+            prError = 'Couldn\'t load PR reviews.';
+          }
+          prLoading = false;
+          renderPRSection();
+          return;
+        }
+
+        prConsecutiveFailures = 0;
+        const items = searchResult.data.items || [];
+
+        // Parallel enrichment with concurrency limit of 5
+        const enriched = await enrichPRs(items);
+
+        // Sort: re-reviews first, then by requested time
+        enriched.sort((a, b) => {
+          if (a.isReReview !== b.isReReview) return a.isReReview ? -1 : 1;
+          return new Date(b.reviewRequestedAt || 0) - new Date(a.reviewRequestedAt || 0);
+        });
+
+        prReviews = enriched;
+        prLoading = false;
+
+        // Cache results
+        await chrome.runtime.sendMessage({ type: 'cachePRs', prs: enriched });
+
+        renderPRSection();
+      } catch (e) {
+        console.error('[PR] Fetch error:', e);
+        prError = 'Couldn\'t load PR reviews.';
+        prLoading = false;
+        renderPRSection();
+      }
+    }
+
+    async function enrichPRs(searchItems) {
+      const results = [];
+      const concurrency = 5;
+      const oldCache = prReviews;
+
+      for (let i = 0; i < searchItems.length; i += concurrency) {
+        const batch = searchItems.slice(i, i + concurrency);
+        const enrichedBatch = await Promise.all(batch.map(async (item) => {
+          const repoUrl = item.repository_url || '';
+          const repoFullName = repoUrl.replace('https://api.github.com/repos/', '');
+          const [owner, repo] = repoFullName.split('/');
+
+          const basePR = {
+            id: item.id,
+            repo: `${owner}/${repo}`,
+            title: item.title,
+            body: item.body || '',
+            number: item.number,
+            htmlUrl: item.html_url,
+            author: { login: item.user?.login, avatarUrl: item.user?.avatar_url },
+            reviewRequestedAt: item.updated_at,
+          };
+
+          try {
+            const [detailResult, reviewsResult, timelineResult] = await Promise.all([
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${item.number}`),
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${item.number}/reviews?per_page=100`),
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/issues/${item.number}/timeline?per_page=100`),
+            ]);
+
+            let enrichedPR = { ...basePR };
+
+            if (detailResult.ok) {
+              const d = detailResult.data;
+              enrichedPR.changedFiles = d.changed_files;
+              enrichedPR.additions = d.additions;
+              enrichedPR.deletions = d.deletions;
+              enrichedPR.labels = (d.labels || []).map(l => ({ name: l.name, color: l.color }));
+              enrichedPR.reviewers = (d.requested_reviewers || []).map(r => ({
+                login: r.login, state: 'PENDING',
+              }));
+              enrichedPR.body = d.body || enrichedPR.body;
+            }
+
+            if (reviewsResult.ok) {
+              const reviewsByUser = {};
+              for (const review of reviewsResult.data) {
+                if (!review.user) continue;
+                reviewsByUser[review.user.login] = review.state;
+              }
+              enrichedPR.isReReview = !!reviewsByUser[githubUsername];
+
+              const existingLogins = new Set((enrichedPR.reviewers || []).map(r => r.login));
+              for (const [login, state] of Object.entries(reviewsByUser)) {
+                if (!existingLogins.has(login)) {
+                  enrichedPR.reviewers = enrichedPR.reviewers || [];
+                  enrichedPR.reviewers.push({ login, state });
+                } else {
+                  const reviewer = enrichedPR.reviewers.find(r => r.login === login);
+                  if (reviewer) reviewer.state = state;
+                }
+              }
+            }
+
+            if (timelineResult.ok) {
+              const events = Array.isArray(timelineResult.data) ? timelineResult.data : [];
+              for (let j = events.length - 1; j >= 0; j--) {
+                const evt = events[j];
+                if (evt.event === 'review_requested' && evt.requested_reviewer?.login === githubUsername) {
+                  enrichedPR.reviewRequestedAt = evt.created_at;
+                  break;
+                }
+              }
+            }
+
+            return enrichedPR;
+          } catch (e) {
+            const cached = oldCache.find(p => p.id === item.id);
+            return cached ? { ...cached, ...basePR } : basePR;
+          }
+        }));
+        results.push(...enrichedBatch);
+      }
+      return results;
     }
 
     // ---- Day Summary ----
@@ -1435,10 +1643,398 @@
     }
 
     // ---- Data Loading ----
+    // ---- PR Helpers ----
+    function timeAgo(dateString) {
+      if (!dateString) return '';
+      const now = Date.now();
+      const then = new Date(dateString).getTime();
+      const diff = now - then;
+      const mins = Math.floor(diff / 60000);
+      if (mins < 1) return 'just now';
+      if (mins < 60) return `${mins}m ago`;
+      const hours = Math.floor(mins / 60);
+      if (hours < 24) return `${hours}h ago`;
+      const days = Math.floor(hours / 24);
+      if (days === 1) return 'Yesterday';
+      return `${days}d ago`;
+    }
+
+    function getEnabledPRRepos() {
+      return enabledPRRepos; // null = show all, Set = filter
+    }
+
+    function filteredPRReviews() {
+      const enabled = getEnabledPRRepos();
+      if (!enabled) return prReviews;
+      return prReviews.filter(pr => enabled.has(pr.repo));
+    }
+
+    // ---- PR Rendering ----
+    function renderPRSection() {
+      const container = document.getElementById('prReviewContainer');
+      if (!container) return;
+
+      // Not connected
+      if (!githubToken) {
+        container.innerHTML = `
+          <div class="pr-section">
+            <div class="pr-section-header">
+              <div class="pr-section-title">PR Reviews</div>
+            </div>
+            <div class="pr-connect-prompt">
+              <div class="pr-connect-icon">🔀</div>
+              <div class="pr-connect-text">Connect GitHub to see PRs awaiting your review</div>
+              <button class="pr-connect-btn" id="connectGitHubBtn">Connect GitHub</button>
+            </div>
+          </div>`;
+        document.getElementById('connectGitHubBtn')?.addEventListener('click', connectGitHub);
+        return;
+      }
+
+      const filtered = filteredPRReviews();
+      const count = filtered.length;
+      const isCollapsed = prSectionCollapsed;
+
+      let bodyHTML = '';
+
+      if (prLoading && prReviews.length === 0) {
+        bodyHTML = `
+          <div class="skeleton pr-skeleton-card"></div>
+          <div class="skeleton pr-skeleton-card"></div>`;
+      } else if (prError) {
+        bodyHTML = `
+          <div class="pr-error">
+            <span>${escapeHtml(prError)}</span>
+            <button class="pr-error-retry" id="prRetryBtn">Retry</button>
+          </div>`;
+      } else if (count === 0) {
+        bodyHTML = `
+          <div class="empty-state" style="padding:12px;">
+            <div class="empty-state-icon" style="font-size:24px;">✓</div>
+            <div class="empty-state-text">No PRs awaiting your review</div>
+          </div>`;
+      } else {
+        bodyHTML = filtered.map(pr => renderPRCard(pr)).join('');
+      }
+
+      // Settings panel
+      let settingsHTML = '';
+      if (prSettingsOpen) {
+        const allRepos = [...new Set(prReviews.map(pr => pr.repo))].sort();
+        const enabled = getEnabledPRRepos();
+        settingsHTML = `
+          <div class="pr-settings open">
+            <div class="pr-settings-user">Connected as @${escapeHtml(githubUsername || '')}</div>
+            <button class="pr-settings-disconnect" id="disconnectGitHubBtn">Disconnect GitHub</button>
+            ${allRepos.length > 0 ? `
+              <div class="pr-filter-label">
+                Filter Repos
+                <div class="pr-filter-actions">
+                  <button id="prFilterAll">All</button>
+                  <button id="prFilterNone">None</button>
+                </div>
+              </div>
+              ${allRepos.map(repo => `
+                <label class="pr-filter-item">
+                  <input type="checkbox" value="${escapeHtml(repo)}" ${!enabled || enabled.has(repo) ? 'checked' : ''}>
+                  <span>${escapeHtml(repo)}</span>
+                </label>
+              `).join('')}
+            ` : ''}
+          </div>`;
+      }
+
+      container.innerHTML = `
+        <div class="pr-section">
+          <div class="pr-section-header" id="prSectionHeader">
+            <div class="pr-section-title">
+              PR Reviews
+              ${count > 0 ? `<span class="pr-section-count">${count}</span>` : ''}
+            </div>
+            <div class="pr-section-actions">
+              <button class="pr-section-gear" id="prSettingsBtn" title="GitHub settings">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="3"/>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                </svg>
+              </button>
+              <span class="pr-section-toggle">${isCollapsed ? '▸' : '▾'}</span>
+            </div>
+          </div>
+          ${settingsHTML}
+          <div class="pr-section-body ${isCollapsed ? 'collapsed' : ''}">
+            ${bodyHTML}
+          </div>
+        </div>`;
+
+      // Event listeners
+      document.getElementById('prSectionHeader')?.addEventListener('click', (e) => {
+        if (e.target.closest('.pr-section-gear')) return;
+        prSectionCollapsed = !prSectionCollapsed;
+        savePrefs();
+        renderPRSection();
+      });
+
+      document.getElementById('prSettingsBtn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        prSettingsOpen = !prSettingsOpen;
+        renderPRSection();
+      });
+
+      document.getElementById('disconnectGitHubBtn')?.addEventListener('click', disconnectGitHub);
+
+      document.getElementById('prRetryBtn')?.addEventListener('click', () => {
+        prConsecutiveFailures = 0;
+        fetchPRReviews();
+      });
+
+      document.getElementById('prFilterAll')?.addEventListener('click', () => {
+        enabledPRRepos = null;
+        chrome.storage.local.remove('enabledPRRepos');
+        renderPRSection();
+      });
+
+      document.getElementById('prFilterNone')?.addEventListener('click', () => {
+        enabledPRRepos = new Set();
+        chrome.storage.local.set({ enabledPRRepos: [] });
+        renderPRSection();
+      });
+
+      container.querySelectorAll('.pr-filter-item input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener('change', () => {
+          const allCheckboxes = container.querySelectorAll('.pr-filter-item input[type="checkbox"]');
+          const enabled = new Set();
+          allCheckboxes.forEach(c => { if (c.checked) enabled.add(c.value); });
+          enabledPRRepos = enabled.size === 0 ? new Set() : enabled;
+          chrome.storage.local.set({ enabledPRRepos: [...enabled] });
+          renderPRSection();
+        });
+      });
+
+      container.querySelectorAll('.pr-card').forEach(card => {
+        card.addEventListener('click', () => {
+          const prId = parseInt(card.dataset.prId);
+          openPRDetail(prId);
+        });
+      });
+
+      updatePRToolbarBadge();
+    }
+
+    function renderPRCard(pr) {
+      const avatarHTML = pr.author?.avatarUrl
+        ? `<img src="${escapeHtml(pr.author.avatarUrl)}&s=48" alt="">`
+        : (pr.author?.login || '?').charAt(0).toUpperCase();
+
+      const reReviewBadge = pr.isReReview
+        ? '<span class="pr-card-rereview">Re-review</span>'
+        : '';
+
+      const diffStats = (pr.additions !== undefined)
+        ? `<span class="pr-card-diff-add">+${pr.additions}</span> <span class="pr-card-diff-del">-${pr.deletions}</span> · ${pr.changedFiles} files`
+        : '';
+
+      const labelsHTML = (pr.labels || []).map(l => {
+        const safeColor = (l.color && /^[0-9a-fA-F]{6}$/.test(l.color)) ? l.color : null;
+        const bg = safeColor ? `#${safeColor}33` : 'var(--hover-bg)';
+        const fg = safeColor ? `#${safeColor}` : 'var(--text-secondary)';
+        return `<span class="pr-card-label" style="background:${bg};color:${fg};">${escapeHtml(l.name)}</span>`;
+      }).join('');
+
+      const reviewerDots = (pr.reviewers || []).map(r => {
+        const cls = r.state === 'APPROVED' ? 'approved'
+          : r.state === 'CHANGES_REQUESTED' ? 'changes-requested'
+          : 'pending';
+        return `<span class="pr-reviewer-dot ${cls}" title="${escapeHtml(r.login)}: ${r.state}"></span>`;
+      }).join('');
+
+      return `
+        <div class="pr-card" data-pr-id="${pr.id}">
+          <div class="pr-card-avatar">${avatarHTML}</div>
+          <div class="pr-card-details">
+            <div class="pr-card-title-row">
+              <span class="pr-card-title">${escapeHtml(pr.title)}</span>
+              ${reReviewBadge}
+            </div>
+            <div class="pr-card-repo">${escapeHtml(pr.repo)}#${pr.number}</div>
+            <div class="pr-card-meta">
+              <span>${timeAgo(pr.reviewRequestedAt)}</span>
+              ${diffStats ? `<span>${diffStats}</span>` : ''}
+            </div>
+            ${labelsHTML ? `<div class="pr-card-labels">${labelsHTML}</div>` : ''}
+            ${reviewerDots ? `<div class="pr-card-reviewers">${reviewerDots}</div>` : ''}
+          </div>
+        </div>`;
+    }
+
+    function openPRDetail(prId) {
+      const pr = prReviews.find(p => p.id === prId);
+      if (!pr) return;
+
+      const screen = document.getElementById('prDetailScreen');
+      const body = document.getElementById('prDetailBody');
+      const title = document.getElementById('prDetailHeaderTitle');
+      const openGH = document.getElementById('prDetailOpenGH');
+
+      title.textContent = `${pr.repo}#${pr.number}`;
+      openGH.href = pr.htmlUrl && pr.htmlUrl.startsWith('https://') ? pr.htmlUrl : '#';
+
+      const descPreview = pr.body
+        ? escapeHtml(pr.body.substring(0, 200)) + (pr.body.length > 200 ? '...' : '')
+        : '<em>No description</em>';
+
+      const reviewersHTML = (pr.reviewers || []).map(r => {
+        const cls = r.state === 'APPROVED' ? 'approved'
+          : r.state === 'CHANGES_REQUESTED' ? 'changes-requested'
+          : 'pending';
+        const label = r.state === 'APPROVED' ? 'Approved'
+          : r.state === 'CHANGES_REQUESTED' ? 'Changes requested'
+          : 'Pending';
+        return `
+          <div class="pr-detail-reviewer">
+            <span style="flex:1;">${escapeHtml(r.login)}</span>
+            <span class="pr-detail-reviewer-status ${cls}">${label}</span>
+          </div>`;
+      }).join('');
+
+      const labelsHTML = (pr.labels || []).map(l => {
+        const safeColor = (l.color && /^[0-9a-fA-F]{6}$/.test(l.color)) ? l.color : null;
+        const bg = safeColor ? `#${safeColor}33` : 'var(--hover-bg)';
+        const fg = safeColor ? `#${safeColor}` : 'var(--text-secondary)';
+        return `<span class="pr-card-label" style="background:${bg};color:${fg};font-size:11px;padding:2px 8px;">${escapeHtml(l.name)}</span>`;
+      }).join(' ');
+
+      const requestedTime = pr.reviewRequestedAt
+        ? new Date(pr.reviewRequestedAt).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+        : 'Unknown';
+
+      body.innerHTML = `
+        <div class="pr-detail-title">${escapeHtml(pr.title)}</div>
+        ${pr.isReReview ? '<span class="pr-card-rereview" style="margin-bottom:12px;display:inline-block;">Re-review</span>' : ''}
+
+        <div class="pr-detail-section">
+          <div class="pr-detail-label">Description</div>
+          <div class="pr-detail-desc">${descPreview}</div>
+        </div>
+
+        <div class="pr-detail-section">
+          <div class="pr-detail-label">Author</div>
+          <div class="pr-detail-stat">
+            <div class="pr-card-avatar" style="width:28px;height:28px;">
+              ${pr.author?.avatarUrl ? `<img src="${escapeHtml(pr.author.avatarUrl)}&s=56" alt="">` : (pr.author?.login || '?').charAt(0).toUpperCase()}
+            </div>
+            <span>${escapeHtml(pr.author?.login || 'Unknown')}</span>
+          </div>
+        </div>
+
+        <div class="pr-detail-section">
+          <div class="pr-detail-label">Details</div>
+          <div class="pr-detail-stat" style="margin-bottom:4px;">
+            <span>Repository:</span> <strong>${escapeHtml(pr.repo)}</strong>
+          </div>
+          <div class="pr-detail-stat" style="margin-bottom:4px;">
+            <span>Requested:</span> <span>${requestedTime}</span>
+          </div>
+          ${pr.changedFiles !== undefined ? `
+            <div class="pr-detail-stat">
+              <span>Changes:</span>
+              <span class="pr-card-diff-add">+${pr.additions}</span>
+              <span class="pr-card-diff-del">-${pr.deletions}</span>
+              <span>across ${pr.changedFiles} files</span>
+            </div>
+          ` : ''}
+        </div>
+
+        ${labelsHTML ? `
+          <div class="pr-detail-section">
+            <div class="pr-detail-label">Labels</div>
+            <div class="pr-card-labels" style="gap:4px;">${labelsHTML}</div>
+          </div>
+        ` : ''}
+
+        ${reviewersHTML ? `
+          <div class="pr-detail-section">
+            <div class="pr-detail-label">Reviewers</div>
+            ${reviewersHTML}
+          </div>
+        ` : ''}
+
+        <div class="pr-detail-actions">
+          <a class="pr-detail-action-btn" href="${escapeHtml(pr.htmlUrl)}" target="_blank">
+            Open in GitHub
+          </a>
+          <a class="pr-detail-action-btn" href="${escapeHtml(pr.htmlUrl)}/files" target="_blank">
+            Open Diff
+          </a>
+        </div>`;
+
+      screen.classList.add('active');
+    }
+
+    function closePRDetail() {
+      document.getElementById('prDetailScreen').classList.remove('active');
+    }
+
+    function updatePRToolbarBadge() {
+      const btn = document.getElementById('prToolbarBtn');
+      const badge = document.getElementById('prBadgeCount');
+      if (!btn || !badge) return;
+
+      if (githubToken) {
+        btn.style.display = '';
+        const count = filteredPRReviews().length;
+        badge.textContent = count > 0 ? count : '';
+      } else {
+        btn.style.display = 'none';
+        badge.textContent = '';
+      }
+    }
+
+    async function connectGitHub() {
+      const btn = document.getElementById('connectGitHubBtn');
+      if (btn) { btn.textContent = 'Connecting...'; btn.disabled = true; }
+
+      const result = await sendMsg({ type: 'startGitHubAuth' });
+      if (result && result.token) {
+        githubToken = result.token;
+        const valid = await validateGitHubToken();
+        if (valid) {
+          showToast(`Connected as @${githubUsername}`);
+          await fetchPRReviews();
+          startPRPolling();
+        } else {
+          githubToken = null;
+          showToast('GitHub authentication failed');
+        }
+      } else {
+        showToast('GitHub connection failed');
+      }
+      renderPRSection();
+    }
+
+    async function disconnectGitHub() {
+      clearInterval(prPollInterval);
+      prPollInterval = null;
+      githubToken = null;
+      githubUsername = null;
+      prReviews = [];
+      prSettingsOpen = false;
+      enabledPRRepos = null;
+      await sendMsg({ type: 'disconnectGitHub' });
+      renderPRSection();
+      updatePRToolbarBadge();
+      showToast('Disconnected from GitHub');
+    }
+
+    function startPRPolling() {
+      if (prPollInterval) clearInterval(prPollInterval);
+      prPollInterval = setInterval(fetchPRReviews, 2 * 60 * 1000);
+    }
+
     function renderAll() {
       renderCalendarFilter(); renderDaySummary(); renderMeetingWarning();
       renderMiniCalendar(); renderNextMeeting(); renderTimeline();
-      renderEvents(); renderWeekStats();
+      renderEvents(); renderWeekStats(); renderPRSection();
     }
 
     async function loadEvents() {
@@ -1470,14 +2066,32 @@
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
       clearInterval(warningInterval);
+      clearInterval(prPollInterval);
       refreshInterval = null;
       countdownInterval = null;
       warningInterval = null;
+      prPollInterval = null;
     }
 
     // ---- Init ----
     async function init() {
       loadPrefs();
+
+      // Load GitHub state
+      const ghData = await chrome.storage.local.get(['githubToken', 'githubUsername', 'enabledPRRepos']);
+      if (ghData.githubToken) {
+        githubToken = ghData.githubToken;
+        githubUsername = ghData.githubUsername || null;
+        if (ghData.enabledPRRepos) {
+          enabledPRRepos = new Set(ghData.enabledPRRepos);
+        }
+      }
+
+      // Load cached PRs for instant display
+      const cachedPRData = await sendMsg({ type: 'getCachedPRs' });
+      if (cachedPRData && cachedPRData.prs) {
+        prReviews = cachedPRData.prs;
+      }
 
       const urls = await sendMsg({ type: 'getRedirectURLs' });
 
@@ -1503,11 +2117,34 @@
         if (authToken) {
           showScreen('mainContent');
           refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
+          // Start GitHub PR polling if connected
+          if (githubToken) {
+            if (githubUsername) {
+              fetchPRReviews();
+              startPRPolling();
+            } else {
+              validateGitHubToken().then(valid => {
+                if (valid) { fetchPRReviews(); startPRPolling(); }
+              });
+            }
+          }
         }
         return;
       }
 
       showScreen('authScreen');
+
+      // Start GitHub PR polling even without Google auth (they are independent)
+      if (githubToken) {
+        if (githubUsername) {
+          fetchPRReviews();
+          startPRPolling();
+        } else {
+          validateGitHubToken().then(valid => {
+            if (valid) { fetchPRReviews(); startPRPolling(); }
+          });
+        }
+      }
 
       if (urls && urls.redirectUrl) {
         showDebug('authDebug',
@@ -1527,6 +2164,9 @@
 
     // Event detail back button
     document.getElementById('detailBackBtn').addEventListener('click', closeEventDetail);
+
+    // PR detail back button
+    document.getElementById('prDetailBackBtn').addEventListener('click', closePRDetail);
 
     // Sign in
     document.getElementById('signInBtn').addEventListener('click', async () => {
@@ -1614,6 +2254,14 @@
 
     // Refresh
     document.getElementById('refreshBtn').addEventListener('click', refreshData);
+
+    // PR toolbar button — scroll to PR section
+    document.getElementById('prToolbarBtn').addEventListener('click', () => {
+      prSectionCollapsed = false;
+      savePrefs();
+      renderPRSection();
+      document.getElementById('prReviewContainer')?.scrollIntoView({ behavior: 'smooth' });
+    });
 
     // Dark mode toggle
     document.getElementById('darkModeBtn').addEventListener('click', () => {
@@ -1720,6 +2368,35 @@
           showToast('Signed out from another tab');
           showScreen('authScreen');
         }
+      }
+
+      // GitHub token sync
+      if (changes.githubToken) {
+        const newToken = changes.githubToken.newValue;
+        if (newToken && newToken !== githubToken) {
+          githubToken = newToken;
+          if (!githubUsername) {
+            validateGitHubToken().then(valid => {
+              if (valid) { fetchPRReviews(); startPRPolling(); }
+              renderPRSection();
+            });
+          }
+        } else if (!newToken && githubToken) {
+          githubToken = null;
+          githubUsername = null;
+          prReviews = [];
+          clearInterval(prPollInterval);
+          prPollInterval = null;
+          renderPRSection();
+          updatePRToolbarBadge();
+        }
+      }
+
+      // PR repo filter sync
+      if (changes.enabledPRRepos) {
+        const newRepos = changes.enabledPRRepos.newValue;
+        enabledPRRepos = newRepos ? new Set(newRepos) : null;
+        renderPRSection();
       }
     });
 

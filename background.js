@@ -2,6 +2,13 @@
 const CLIENT_ID = '213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly';
 
+// ---- GITHUB CONFIG ----
+const GITHUB_CLIENT_ID = 'Ov23liLXcKeNsvuH4dg4';
+const GITHUB_WORKER_URL = 'https://github-token-exchange.dr-bizz.workers.dev';
+// 'repo' scope is required to access private repository PRs via the GitHub API.
+// GitHub does not offer a narrower scope for read-only PR access on private repos.
+const GITHUB_SCOPE = 'repo';
+
 // ---- SIDE PANEL SETUP ----
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
@@ -64,6 +71,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create('checkToken', { periodInMinutes: 1 });
   chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
   chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
+  chrome.alarms.create('checkPRs', { periodInMinutes: 10 });
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -159,6 +167,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         // Auto-dismiss notifications for events that started 10+ minutes ago
         chrome.notifications.getAll((active) => {
           for (const id of Object.keys(active)) {
+            if (id.startsWith('pr::')) continue; // Skip PR notifications
             const parts = id.split('::');
             const ts = parseInt(parts[parts.length - 1]);
             if (ts && now - ts > 10 * 60 * 1000) {
@@ -188,18 +197,21 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (alarm.name === 'updateBadge') {
-    // Badge support: show upcoming event info on the extension badge
     try {
-      const data = await chrome.storage.local.get(['cachedEvents']);
+      const data = await chrome.storage.local.get(['cachedEvents', 'cachedPRs', 'enabledPRRepos']);
+
+      // Helper: get filtered PR count
+      function getPRCount() {
+        if (!data.cachedPRs || !Array.isArray(data.cachedPRs)) return 0;
+        const enabledRepos = data.enabledPRRepos ? new Set(data.enabledPRRepos) : null;
+        return data.cachedPRs.filter(pr => !enabledRepos || enabledRepos.has(pr.repo)).length;
+      }
+
       if (data.cachedEvents && Array.isArray(data.cachedEvents)) {
         const now = Date.now();
-        // Find the next upcoming timed event (has dateTime, not all-day)
         const upcoming = data.cachedEvents
           .filter(event => event.start && event.start.dateTime)
-          .map(event => ({
-            ...event,
-            startMs: new Date(event.start.dateTime).getTime()
-          }))
+          .map(event => ({ ...event, startMs: new Date(event.start.dateTime).getTime() }))
           .filter(event => event.startMs > now)
           .sort((a, b) => a.startMs - b.startMs);
 
@@ -214,16 +226,133 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             chrome.action.setBadgeText({ text: `${minutesUntil}m` });
             chrome.action.setBadgeBackgroundColor({ color: '#0000FF' });
           } else {
+            const prCount = getPRCount();
+            if (prCount > 0) {
+              chrome.action.setBadgeText({ text: `${prCount}` });
+              chrome.action.setBadgeBackgroundColor({ color: '#8e24aa' });
+            } else {
+              chrome.action.setBadgeText({ text: '' });
+            }
+          }
+        } else {
+          const prCount = getPRCount();
+          if (prCount > 0) {
+            chrome.action.setBadgeText({ text: `${prCount}` });
+            chrome.action.setBadgeBackgroundColor({ color: '#8e24aa' });
+          } else {
             chrome.action.setBadgeText({ text: '' });
           }
+        }
+      } else {
+        const prCount = getPRCount();
+        if (prCount > 0) {
+          chrome.action.setBadgeText({ text: `${prCount}` });
+          chrome.action.setBadgeBackgroundColor({ color: '#8e24aa' });
         } else {
           chrome.action.setBadgeText({ text: '' });
         }
-      } else {
-        chrome.action.setBadgeText({ text: '' });
       }
     } catch (e) {
       console.error('[Alarms] updateBadge error:', e);
+    }
+  }
+
+  if (alarm.name === 'checkPRs') {
+    try {
+      const data = await chrome.storage.local.get(['githubToken', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'enabledPRRepos']);
+      if (!data.githubToken || !data.githubUsername) return;
+
+      // Deduplication: skip if cache was updated less than 90 seconds ago
+      if (data.prCacheTime && Date.now() - data.prCacheTime < 90000) return;
+
+      // Lightweight search-only fetch (no enrichment)
+      const searchUrl = `https://api.github.com/search/issues?q=type:pr+review-requested:${encodeURIComponent(data.githubUsername)}+is:open&per_page=100`;
+      const response = await fetch(searchUrl, {
+        headers: {
+          'Authorization': `Bearer ${data.githubToken}`,
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+
+      if (response.status === 401) {
+        await chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys']);
+        return;
+      }
+
+      if (response.status === 403) {
+        console.warn('[checkPRs] Rate limited, skipping this cycle');
+        return;
+      }
+
+      if (!response.ok) return;
+
+      const searchData = await response.json();
+      const newPRs = (searchData.items || []).map(item => {
+        const repoFullName = (item.repository_url || '').replace('https://api.github.com/repos/', '');
+        return {
+          id: item.id,
+          repo: repoFullName,
+          title: item.title,
+          number: item.number,
+          htmlUrl: item.html_url,
+          author: { login: item.user?.login, avatarUrl: item.user?.avatar_url },
+        };
+      });
+
+      // Detect new review requests
+      const oldIds = new Set((data.cachedPRs || []).map(pr => pr.id));
+      const notifiedKeys = new Set(data.notifiedPRKeys || []);
+      const enabledRepos = data.enabledPRRepos ? new Set(data.enabledPRRepos) : null;
+      let notifiedChanged = false;
+
+      for (const pr of newPRs) {
+        // Respect repo filter
+        if (enabledRepos && !enabledRepos.has(pr.repo)) continue;
+
+        if (!oldIds.has(pr.id) && !notifiedKeys.has(`pr::${pr.id}`)) {
+          const oldPR = (data.cachedPRs || []).find(p => p.id === pr.id);
+          const isReReview = oldPR ? oldPR.isReReview : false;
+
+          const notifOptions = {
+            type: 'basic',
+            iconUrl: 'icons/icon128.png',
+            title: `${pr.repo} #${pr.number}`,
+            message: `${isReReview ? 'Re-review' : 'Review'} requested: ${pr.title}`,
+            priority: isReReview ? 2 : 1,
+            requireInteraction: isReReview,
+          };
+
+          chrome.notifications.create(`pr::${pr.id}`, notifOptions);
+          notifiedKeys.add(`pr::${pr.id}`);
+          notifiedChanged = true;
+        }
+      }
+
+      // Cleanup: remove notified keys for PRs no longer requesting review
+      const currentIds = new Set(newPRs.map(pr => pr.id));
+      for (const key of notifiedKeys) {
+        if (key.startsWith('pr::')) {
+          const prId = parseInt(key.substring(4));
+          if (!currentIds.has(prId)) {
+            notifiedKeys.delete(key);
+            notifiedChanged = true;
+          }
+        }
+      }
+
+      // Merge new lightweight data with existing enriched cache
+      const mergedPRs = newPRs.map(newPR => {
+        const existing = (data.cachedPRs || []).find(p => p.id === newPR.id);
+        return existing ? { ...existing, ...newPR } : newPR;
+      });
+
+      const updates = { cachedPRs: mergedPRs, prCacheTime: Date.now() };
+      if (notifiedChanged) updates.notifiedPRKeys = [...notifiedKeys];
+      await chrome.storage.local.set(updates);
+
+    } catch (e) {
+      console.error('[Alarms] checkPRs error:', e);
     }
   }
 });
@@ -247,14 +376,38 @@ function openEventUrl(event) {
 }
 
 chrome.notifications.onClicked.addListener((notificationId) => {
-  findEventFromNotification(notificationId, (event) => {
-    if (event) openEventUrl(event);
-  });
+  if (notificationId.startsWith('pr::')) {
+    // PR notification — look up the htmlUrl from cached PRs
+    chrome.storage.local.get(['cachedPRs'], (data) => {
+      const prId = parseInt(notificationId.substring(4));
+      const pr = (data.cachedPRs || []).find(p => p.id === prId);
+      if (pr && pr.htmlUrl && isSafeUrl(pr.htmlUrl)) {
+        chrome.tabs.create({ url: pr.htmlUrl });
+      }
+    });
+  } else {
+    // Calendar event notification
+    findEventFromNotification(notificationId, (event) => {
+      if (event) openEventUrl(event);
+    });
+  }
   chrome.notifications.clear(notificationId);
 });
 
 chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
-  if (buttonIndex === 0) {
+  if (notificationId.startsWith('pr::')) {
+    // PR notification button — open in GitHub
+    if (buttonIndex === 0) {
+      chrome.storage.local.get(['cachedPRs'], (data) => {
+        const prId = parseInt(notificationId.substring(4));
+        const pr = (data.cachedPRs || []).find(p => p.id === prId);
+        if (pr && pr.htmlUrl) {
+          chrome.tabs.create({ url: pr.htmlUrl });
+        }
+      });
+    }
+  } else if (buttonIndex === 0) {
+    // Calendar event button
     findEventFromNotification(notificationId, (event) => {
       if (event && event.hangoutLink && isSafeUrl(event.hangoutLink)) {
         chrome.tabs.create({ url: event.hangoutLink });
@@ -414,6 +567,86 @@ async function authViaTab() {
   });
 }
 
+// ---- GITHUB AUTH ----
+async function authViaGitHub() {
+  if (GITHUB_CLIENT_ID === 'YOUR_GITHUB_CLIENT_ID' || GITHUB_WORKER_URL.includes('YOUR_SUBDOMAIN')) {
+    return { error: 'GitHub integration not configured. Update GITHUB_CLIENT_ID and GITHUB_WORKER_URL in background.js.' };
+  }
+  return new Promise((resolve) => {
+    const redirectUri = getRedirectURL();
+    const state = crypto.randomUUID();
+    const params = new URLSearchParams({
+      client_id: GITHUB_CLIENT_ID,
+      redirect_uri: redirectUri,
+      scope: GITHUB_SCOPE,
+      state,
+    });
+    const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+
+    console.log('[GitHub Auth] Starting OAuth flow');
+    console.log('[GitHub Auth] Redirect URI:', redirectUri);
+
+    try {
+      chrome.identity.launchWebAuthFlow(
+        { url: authUrl, interactive: true },
+        async (responseUrl) => {
+          if (chrome.runtime.lastError || !responseUrl) {
+            console.warn('[GitHub Auth] Failed:', chrome.runtime.lastError?.message);
+            resolve({ error: chrome.runtime.lastError?.message || 'No response' });
+            return;
+          }
+
+          try {
+            const url = new URL(responseUrl);
+            const code = url.searchParams.get('code');
+            const returnedState = url.searchParams.get('state');
+
+            if (!code) {
+              resolve({ error: 'No authorization code in response' });
+              return;
+            }
+
+            if (returnedState !== state) {
+              resolve({ error: 'State mismatch — possible CSRF attack' });
+              return;
+            }
+
+            // Exchange code for token via Cloudflare Worker
+            const tokenResponse = await fetch(`${GITHUB_WORKER_URL}/github/token`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ code }),
+            });
+
+            const data = await tokenResponse.json();
+            if (data.error) {
+              resolve({ error: data.error });
+              return;
+            }
+
+            if (data.access_token) {
+              console.log('[GitHub Auth] Success!');
+              await chrome.storage.local.set({
+                githubToken: data.access_token,
+                githubTokenTime: Date.now(),
+              });
+              resolve({ token: data.access_token });
+            } else {
+              resolve({ error: 'No access token in worker response' });
+            }
+          } catch (e) {
+            console.error('[GitHub Auth] Token exchange error:', e);
+            resolve({ error: e.message });
+          }
+        }
+      );
+    } catch (e) {
+      console.warn('[GitHub Auth] Exception:', e.message);
+      resolve({ error: e.message });
+    }
+  });
+}
+
 // ---- MESSAGE HANDLING ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
@@ -560,6 +793,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({
         events: data.cachedEvents || null,
         cacheTime: data.cacheTime || null
+      });
+    });
+    return true;
+  }
+
+  // ---- GITHUB AUTH MESSAGE HANDLERS ----
+  if (message.type === 'startGitHubAuth') {
+    (async () => {
+      const result = await authViaGitHub();
+      sendResponse(result);
+    })();
+    return true;
+  }
+
+  if (message.type === 'getGitHubToken') {
+    chrome.storage.local.get(['githubToken'], (data) => {
+      sendResponse({ token: data.githubToken || null });
+    });
+    return true;
+  }
+
+  if (message.type === 'disconnectGitHub') {
+    chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'githubUsername'], () => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  // ---- PR CACHING MESSAGE HANDLERS ----
+  if (message.type === 'cachePRs') {
+    chrome.storage.local.set({
+      cachedPRs: message.prs,
+      prCacheTime: Date.now(),
+    }, () => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  if (message.type === 'getCachedPRs') {
+    chrome.storage.local.get(['cachedPRs', 'prCacheTime'], (data) => {
+      sendResponse({
+        prs: data.cachedPRs || null,
+        cacheTime: data.prCacheTime || null,
       });
     });
     return true;
