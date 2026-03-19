@@ -3,8 +3,8 @@ const CLIENT_ID = '213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleuser
 const SCOPES = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly';
 
 // ---- GITHUB CONFIG ----
-const GITHUB_CLIENT_ID = 'YOUR_GITHUB_CLIENT_ID';
-const GITHUB_WORKER_URL = 'https://github-token-exchange.YOUR_SUBDOMAIN.workers.dev';
+const GITHUB_CLIENT_ID = 'Ov23liLXcKeNsvuH4dg4';
+const GITHUB_WORKER_URL = 'https://github-token-exchange.dr-bizz.workers.dev';
 // 'repo' scope is required to access private repository PRs via the GitHub API.
 // GitHub does not offer a narrower scope for read-only PR access on private repos.
 const GITHUB_SCOPE = 'repo';
