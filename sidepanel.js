@@ -13,6 +13,18 @@
     let compactMode = false;
     let darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
 
+    // ---- GitHub PR State ----
+    let githubToken = null;
+    let githubUsername = null;
+    let prReviews = [];
+    let prSectionCollapsed = false;
+    let prSettingsOpen = false;
+    let prLoading = false;
+    let prError = null;
+    let enabledPRRepos = null; // null = show all, Set once loaded
+    let prPollInterval = null;
+    let prConsecutiveFailures = 0;
+
     const CALENDAR_COLORS = {
       '1':'#7986cb','2':'#33b679','3':'#8e24aa','4':'#e67c73',
       '5':'#f6bf26','6':'#f4511e','7':'#039be5','8':'#616161',
@@ -29,6 +41,7 @@
           if (p.compactMode !== undefined) compactMode = p.compactMode;
           if (p.miniCalCollapsed !== undefined) miniCalCollapsed = p.miniCalCollapsed;
           if (p.enabledCalendarIds) enabledCalendarIds = new Set(p.enabledCalendarIds);
+          if (p.prSectionCollapsed !== undefined) prSectionCollapsed = p.prSectionCollapsed;
         }
       } catch (e) {}
       applyPrefs();
@@ -36,7 +49,7 @@
     function savePrefs() {
       try {
         localStorage.setItem('calPrefs', JSON.stringify({
-          darkMode, compactMode, miniCalCollapsed,
+          darkMode, compactMode, miniCalCollapsed, prSectionCollapsed,
           enabledCalendarIds: enabledCalendarIds ? [...enabledCalendarIds] : null
         }));
       } catch (e) {}
@@ -350,6 +363,189 @@
         }
       } catch (e) {}
       return null;
+    }
+
+    // ---- GitHub PR API ----
+    async function githubFetch(url) {
+      if (!githubToken) return { ok: false, status: 0 };
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `token ${githubToken}`,
+          'Accept': 'application/vnd.github.v3+json',
+        },
+      });
+      if (response.status === 401) {
+        githubToken = null;
+        githubUsername = null;
+        await chrome.runtime.sendMessage({ type: 'disconnectGitHub' });
+        return { ok: false, status: 401 };
+      }
+      if (!response.ok) return { ok: false, status: response.status, headers: response.headers };
+      const data = await response.json();
+      return { ok: true, data, headers: response.headers };
+    }
+
+    async function validateGitHubToken() {
+      const result = await githubFetch('https://api.github.com/user');
+      if (result.ok) {
+        githubUsername = result.data.login;
+        await chrome.storage.local.set({ githubUsername: githubUsername });
+        return true;
+      }
+      return false;
+    }
+
+    async function fetchPRReviews() {
+      if (!githubToken || !githubUsername) return;
+      prLoading = true;
+      prError = null;
+      renderPRSection();
+
+      try {
+        // Check deduplication
+        const cached = await chrome.runtime.sendMessage({ type: 'getCachedPRs' });
+        if (cached && cached.cacheTime && Date.now() - cached.cacheTime < 90000) {
+          if (cached.prs) prReviews = cached.prs;
+          prLoading = false;
+          renderPRSection();
+          return;
+        }
+
+        // Search for PRs requesting review
+        const searchResult = await githubFetch(
+          `https://api.github.com/search/issues?q=type:pr+review-requested:${githubUsername}+is:open&per_page=100`
+        );
+
+        if (searchResult.status === 403) {
+          prConsecutiveFailures++;
+          if (prConsecutiveFailures >= 3) {
+            prError = 'GitHub rate limit exceeded. Try again later.';
+          }
+          prLoading = false;
+          renderPRSection();
+          return;
+        }
+
+        if (!searchResult.ok) {
+          prConsecutiveFailures++;
+          if (prConsecutiveFailures >= 3) {
+            prError = 'Couldn\'t load PR reviews.';
+          }
+          prLoading = false;
+          renderPRSection();
+          return;
+        }
+
+        prConsecutiveFailures = 0;
+        const items = searchResult.data.items || [];
+
+        // Parallel enrichment with concurrency limit of 5
+        const enriched = await enrichPRs(items);
+
+        // Sort: re-reviews first, then by requested time
+        enriched.sort((a, b) => {
+          if (a.isReReview !== b.isReReview) return a.isReReview ? -1 : 1;
+          return new Date(b.reviewRequestedAt || 0) - new Date(a.reviewRequestedAt || 0);
+        });
+
+        prReviews = enriched;
+        prLoading = false;
+
+        // Cache results
+        await chrome.runtime.sendMessage({ type: 'cachePRs', prs: enriched });
+
+        renderPRSection();
+      } catch (e) {
+        console.error('[PR] Fetch error:', e);
+        prError = 'Couldn\'t load PR reviews.';
+        prLoading = false;
+        renderPRSection();
+      }
+    }
+
+    async function enrichPRs(searchItems) {
+      const results = [];
+      const concurrency = 5;
+      const oldCache = prReviews;
+
+      for (let i = 0; i < searchItems.length; i += concurrency) {
+        const batch = searchItems.slice(i, i + concurrency);
+        const enrichedBatch = await Promise.all(batch.map(async (item) => {
+          const repoUrl = item.repository_url || '';
+          const repoFullName = repoUrl.replace('https://api.github.com/repos/', '');
+          const [owner, repo] = repoFullName.split('/');
+
+          const basePR = {
+            id: item.id,
+            repo: `${owner}/${repo}`,
+            title: item.title,
+            body: item.body || '',
+            number: item.number,
+            htmlUrl: item.html_url,
+            author: { login: item.user?.login, avatarUrl: item.user?.avatar_url },
+            reviewRequestedAt: item.updated_at,
+          };
+
+          try {
+            const [detailResult, reviewsResult, timelineResult] = await Promise.all([
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${item.number}`),
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${item.number}/reviews`),
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/issues/${item.number}/timeline`),
+            ]);
+
+            let enrichedPR = { ...basePR };
+
+            if (detailResult.ok) {
+              const d = detailResult.data;
+              enrichedPR.changedFiles = d.changed_files;
+              enrichedPR.additions = d.additions;
+              enrichedPR.deletions = d.deletions;
+              enrichedPR.labels = (d.labels || []).map(l => ({ name: l.name, color: l.color }));
+              enrichedPR.reviewers = (d.requested_reviewers || []).map(r => ({
+                login: r.login, state: 'PENDING',
+              }));
+              enrichedPR.body = d.body || enrichedPR.body;
+            }
+
+            if (reviewsResult.ok) {
+              const reviewsByUser = {};
+              for (const review of reviewsResult.data) {
+                reviewsByUser[review.user.login] = review.state;
+              }
+              enrichedPR.isReReview = !!reviewsByUser[githubUsername];
+
+              const existingLogins = new Set((enrichedPR.reviewers || []).map(r => r.login));
+              for (const [login, state] of Object.entries(reviewsByUser)) {
+                if (!existingLogins.has(login)) {
+                  enrichedPR.reviewers = enrichedPR.reviewers || [];
+                  enrichedPR.reviewers.push({ login, state });
+                } else {
+                  const reviewer = enrichedPR.reviewers.find(r => r.login === login);
+                  if (reviewer) reviewer.state = state;
+                }
+              }
+            }
+
+            if (timelineResult.ok) {
+              const events = Array.isArray(timelineResult.data) ? timelineResult.data : [];
+              for (let j = events.length - 1; j >= 0; j--) {
+                const evt = events[j];
+                if (evt.event === 'review_requested' && evt.requested_reviewer?.login === githubUsername) {
+                  enrichedPR.reviewRequestedAt = evt.created_at;
+                  break;
+                }
+              }
+            }
+
+            return enrichedPR;
+          } catch (e) {
+            const cached = oldCache.find(p => p.id === item.id);
+            return cached ? { ...cached, ...basePR } : basePR;
+          }
+        }));
+        results.push(...enrichedBatch);
+      }
+      return results;
     }
 
     // ---- Day Summary ----
