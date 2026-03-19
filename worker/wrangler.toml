@@ -4,3 +4,4 @@ compatibility_date = "2026-01-01"
 
 [vars]
 GITHUB_CLIENT_ID = "YOUR_GITHUB_CLIENT_ID"
+EXTENSION_ID = "YOUR_EXTENSION_ID"

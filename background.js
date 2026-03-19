@@ -5,6 +5,8 @@ const SCOPES = 'https://www.googleapis.com/auth/calendar.events https://www.goog
 // ---- GITHUB CONFIG ----
 const GITHUB_CLIENT_ID = 'YOUR_GITHUB_CLIENT_ID';
 const GITHUB_WORKER_URL = 'https://github-token-exchange.YOUR_SUBDOMAIN.workers.dev';
+// 'repo' scope is required to access private repository PRs via the GitHub API.
+// GitHub does not offer a narrower scope for read-only PR access on private repos.
 const GITHUB_SCOPE = 'repo';
 
 // ---- SIDE PANEL SETUP ----
@@ -264,16 +266,17 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       if (data.prCacheTime && Date.now() - data.prCacheTime < 90000) return;
 
       // Lightweight search-only fetch (no enrichment)
-      const searchUrl = `https://api.github.com/search/issues?q=type:pr+review-requested:${data.githubUsername}+is:open&per_page=100`;
+      const searchUrl = `https://api.github.com/search/issues?q=type:pr+review-requested:${encodeURIComponent(data.githubUsername)}+is:open&per_page=100`;
       const response = await fetch(searchUrl, {
         headers: {
-          'Authorization': `token ${data.githubToken}`,
-          'Accept': 'application/vnd.github.v3+json',
+          'Authorization': `Bearer ${data.githubToken}`,
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
         },
       });
 
       if (response.status === 401) {
-        await chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'githubUsername']);
+        await chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys']);
         return;
       }
 
@@ -378,7 +381,7 @@ chrome.notifications.onClicked.addListener((notificationId) => {
     chrome.storage.local.get(['cachedPRs'], (data) => {
       const prId = parseInt(notificationId.substring(4));
       const pr = (data.cachedPRs || []).find(p => p.id === prId);
-      if (pr && pr.htmlUrl) {
+      if (pr && pr.htmlUrl && isSafeUrl(pr.htmlUrl)) {
         chrome.tabs.create({ url: pr.htmlUrl });
       }
     });
@@ -566,6 +569,9 @@ async function authViaTab() {
 
 // ---- GITHUB AUTH ----
 async function authViaGitHub() {
+  if (GITHUB_CLIENT_ID === 'YOUR_GITHUB_CLIENT_ID' || GITHUB_WORKER_URL.includes('YOUR_SUBDOMAIN')) {
+    return { error: 'GitHub integration not configured. Update GITHUB_CLIENT_ID and GITHUB_WORKER_URL in background.js.' };
+  }
   return new Promise((resolve) => {
     const redirectUri = getRedirectURL();
     const state = crypto.randomUUID();

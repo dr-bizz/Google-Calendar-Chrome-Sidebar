@@ -368,21 +368,32 @@
     // ---- GitHub PR API ----
     async function githubFetch(url) {
       if (!githubToken) return { ok: false, status: 0 };
-      const response = await fetch(url, {
-        headers: {
-          'Authorization': `token ${githubToken}`,
-          'Accept': 'application/vnd.github.v3+json',
-        },
-      });
-      if (response.status === 401) {
-        githubToken = null;
-        githubUsername = null;
-        await chrome.runtime.sendMessage({ type: 'disconnectGitHub' });
-        return { ok: false, status: 401 };
+      try {
+        const response = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${githubToken}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+          },
+        });
+        if (response.status === 401) {
+          githubToken = null;
+          githubUsername = null;
+          prReviews = [];
+          enabledPRRepos = null;
+          clearInterval(prPollInterval);
+          prPollInterval = null;
+          await chrome.runtime.sendMessage({ type: 'disconnectGitHub' });
+          renderPRSection();
+          updatePRToolbarBadge();
+          return { ok: false, status: 401 };
+        }
+        if (!response.ok) return { ok: false, status: response.status, headers: response.headers };
+        const data = await response.json();
+        return { ok: true, data, headers: response.headers };
+      } catch (e) {
+        return { ok: false, status: 0 };
       }
-      if (!response.ok) return { ok: false, status: response.status, headers: response.headers };
-      const data = await response.json();
-      return { ok: true, data, headers: response.headers };
     }
 
     async function validateGitHubToken() {
@@ -413,7 +424,7 @@
 
         // Search for PRs requesting review
         const searchResult = await githubFetch(
-          `https://api.github.com/search/issues?q=type:pr+review-requested:${githubUsername}+is:open&per_page=100`
+          `https://api.github.com/search/issues?q=type:pr+review-requested:${encodeURIComponent(githubUsername)}+is:open&per_page=100`
         );
 
         if (searchResult.status === 403) {
@@ -489,8 +500,8 @@
           try {
             const [detailResult, reviewsResult, timelineResult] = await Promise.all([
               githubFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${item.number}`),
-              githubFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${item.number}/reviews`),
-              githubFetch(`https://api.github.com/repos/${owner}/${repo}/issues/${item.number}/timeline`),
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${item.number}/reviews?per_page=100`),
+              githubFetch(`https://api.github.com/repos/${owner}/${repo}/issues/${item.number}/timeline?per_page=100`),
             ]);
 
             let enrichedPR = { ...basePR };
@@ -510,6 +521,7 @@
             if (reviewsResult.ok) {
               const reviewsByUser = {};
               for (const review of reviewsResult.data) {
+                if (!review.user) continue;
                 reviewsByUser[review.user.login] = review.state;
               }
               enrichedPR.isReReview = !!reviewsByUser[githubUsername];
@@ -1823,8 +1835,9 @@
         : '';
 
       const labelsHTML = (pr.labels || []).map(l => {
-        const bg = l.color ? `#${l.color}20` : 'var(--hover-bg)';
-        const fg = l.color ? `#${l.color}` : 'var(--text-secondary)';
+        const safeColor = (l.color && /^[0-9a-fA-F]{6}$/.test(l.color)) ? l.color : null;
+        const bg = safeColor ? `#${safeColor}33` : 'var(--hover-bg)';
+        const fg = safeColor ? `#${safeColor}` : 'var(--text-secondary)';
         return `<span class="pr-card-label" style="background:${bg};color:${fg};">${escapeHtml(l.name)}</span>`;
       }).join('');
 
@@ -1864,7 +1877,7 @@
       const openGH = document.getElementById('prDetailOpenGH');
 
       title.textContent = `${pr.repo}#${pr.number}`;
-      openGH.href = pr.htmlUrl;
+      openGH.href = pr.htmlUrl && pr.htmlUrl.startsWith('https://') ? pr.htmlUrl : '#';
 
       const descPreview = pr.body
         ? escapeHtml(pr.body.substring(0, 200)) + (pr.body.length > 200 ? '...' : '')
@@ -1885,8 +1898,9 @@
       }).join('');
 
       const labelsHTML = (pr.labels || []).map(l => {
-        const bg = l.color ? `#${l.color}20` : 'var(--hover-bg)';
-        const fg = l.color ? `#${l.color}` : 'var(--text-secondary)';
+        const safeColor = (l.color && /^[0-9a-fA-F]{6}$/.test(l.color)) ? l.color : null;
+        const bg = safeColor ? `#${safeColor}33` : 'var(--hover-bg)';
+        const fg = safeColor ? `#${safeColor}` : 'var(--text-secondary)';
         return `<span class="pr-card-label" style="background:${bg};color:${fg};font-size:11px;padding:2px 8px;">${escapeHtml(l.name)}</span>`;
       }).join(' ');
 
