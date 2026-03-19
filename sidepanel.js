@@ -2052,14 +2052,32 @@
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
       clearInterval(warningInterval);
+      clearInterval(prPollInterval);
       refreshInterval = null;
       countdownInterval = null;
       warningInterval = null;
+      prPollInterval = null;
     }
 
     // ---- Init ----
     async function init() {
       loadPrefs();
+
+      // Load GitHub state
+      const ghData = await chrome.storage.local.get(['githubToken', 'githubUsername', 'enabledPRRepos']);
+      if (ghData.githubToken) {
+        githubToken = ghData.githubToken;
+        githubUsername = ghData.githubUsername || null;
+        if (ghData.enabledPRRepos) {
+          enabledPRRepos = new Set(ghData.enabledPRRepos);
+        }
+      }
+
+      // Load cached PRs for instant display
+      const cachedPRData = await sendMsg({ type: 'getCachedPRs' });
+      if (cachedPRData && cachedPRData.prs) {
+        prReviews = cachedPRData.prs;
+      }
 
       const urls = await sendMsg({ type: 'getRedirectURLs' });
 
@@ -2085,11 +2103,34 @@
         if (authToken) {
           showScreen('mainContent');
           refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
+          // Start GitHub PR polling if connected
+          if (githubToken) {
+            if (githubUsername) {
+              fetchPRReviews();
+              startPRPolling();
+            } else {
+              validateGitHubToken().then(valid => {
+                if (valid) { fetchPRReviews(); startPRPolling(); }
+              });
+            }
+          }
         }
         return;
       }
 
       showScreen('authScreen');
+
+      // Start GitHub PR polling even without Google auth (they are independent)
+      if (githubToken) {
+        if (githubUsername) {
+          fetchPRReviews();
+          startPRPolling();
+        } else {
+          validateGitHubToken().then(valid => {
+            if (valid) { fetchPRReviews(); startPRPolling(); }
+          });
+        }
+      }
 
       if (urls && urls.redirectUrl) {
         showDebug('authDebug',
@@ -2109,6 +2150,9 @@
 
     // Event detail back button
     document.getElementById('detailBackBtn').addEventListener('click', closeEventDetail);
+
+    // PR detail back button
+    document.getElementById('prDetailBackBtn').addEventListener('click', closePRDetail);
 
     // Sign in
     document.getElementById('signInBtn').addEventListener('click', async () => {
@@ -2196,6 +2240,14 @@
 
     // Refresh
     document.getElementById('refreshBtn').addEventListener('click', refreshData);
+
+    // PR toolbar button — scroll to PR section
+    document.getElementById('prToolbarBtn').addEventListener('click', () => {
+      prSectionCollapsed = false;
+      savePrefs();
+      renderPRSection();
+      document.getElementById('prReviewContainer')?.scrollIntoView({ behavior: 'smooth' });
+    });
 
     // Dark mode toggle
     document.getElementById('darkModeBtn').addEventListener('click', () => {
@@ -2302,6 +2354,35 @@
           showToast('Signed out from another tab');
           showScreen('authScreen');
         }
+      }
+
+      // GitHub token sync
+      if (changes.githubToken) {
+        const newToken = changes.githubToken.newValue;
+        if (newToken && newToken !== githubToken) {
+          githubToken = newToken;
+          if (!githubUsername) {
+            validateGitHubToken().then(valid => {
+              if (valid) { fetchPRReviews(); startPRPolling(); }
+              renderPRSection();
+            });
+          }
+        } else if (!newToken && githubToken) {
+          githubToken = null;
+          githubUsername = null;
+          prReviews = [];
+          clearInterval(prPollInterval);
+          prPollInterval = null;
+          renderPRSection();
+          updatePRToolbarBadge();
+        }
+      }
+
+      // PR repo filter sync
+      if (changes.enabledPRRepos) {
+        const newRepos = changes.enabledPRRepos.newValue;
+        enabledPRRepos = newRepos ? new Set(newRepos) : null;
+        renderPRSection();
       }
     });
 
