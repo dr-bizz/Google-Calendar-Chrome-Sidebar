@@ -726,7 +726,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (age < 3500000) {
           sendResponse({ token: data.accessToken });
         } else {
-          chrome.storage.local.remove(['accessToken', 'tokenTime']);
+          // Token expired — return null but do NOT remove from storage.
+          // Removing it triggers storage.onChanged across all tabs,
+          // causing a sign-out cascade. The stale token sits inert until
+          // overwritten by a successful refresh or cleared by explicit sign-out.
           sendResponse({ token: null });
         }
       } else {
