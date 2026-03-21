@@ -2361,12 +2361,61 @@
             });
           }
         } else if (!newToken && oldToken) {
-          // Token was cleared (sign out from another tab)
-          authToken = null;
-          clearAllIntervals();
-          events = [];
-          showToast('Signed out from another tab');
-          showScreen('authScreen');
+          // Token was cleared — check if this is an explicit sign-out or token expiry.
+          // This recovery path is a safety net: the primary recovery mechanism is the
+          // checkToken alarm in background.js which refreshes tokens proactively.
+          // This code handles edge cases where the token is removed from storage
+          // without an explicit sign-out (e.g., external revocation).
+          (async () => {
+            try {
+              const data = await chrome.storage.local.get(['explicitSignOutTime']);
+              const signOutAge = data.explicitSignOutTime
+                ? Date.now() - data.explicitSignOutTime
+                : Infinity;
+
+              if (signOutAge < 5000) {
+                // Explicit sign-out from another tab — sign out this tab too
+                authToken = null;
+                clearAllIntervals();
+                events = [];
+                showToast('Signed out from another tab');
+                showScreen('authScreen');
+                return;
+              }
+
+              // Token expiry — attempt silent recovery
+              console.log('[Auth] Token cleared (not explicit sign-out), attempting silent recovery...');
+
+              // Step 1: Try silent refresh
+              const silent = await sendMsg({ type: 'silentRefresh' });
+              if (silent && silent.token) {
+                console.log('[Auth] Silent recovery succeeded');
+                authToken = silent.token;
+                clearReAuthBanner();
+                return;
+              }
+
+              // Step 2: Check if another tab already refreshed
+              const stored = await sendMsg({ type: 'getStoredToken' });
+              if (stored && stored.token) {
+                console.log('[Auth] Picked up token from another tab');
+                authToken = stored.token;
+                clearReAuthBanner();
+                return;
+              }
+
+              // Step 3: All recovery failed — show re-auth banner (not auth screen)
+              console.log('[Auth] Silent recovery failed, showing re-auth banner');
+              authToken = null;
+              showReAuthBanner();
+            } catch (e) {
+              // Catches extension context invalidation (e.g., extension updated/reloaded).
+              // sendMsg itself never rejects — it resolves with { error: ... } on failure.
+              console.error('[Auth] Recovery error:', e);
+              authToken = null;
+              showReAuthBanner();
+            }
+          })();
         }
       }
 

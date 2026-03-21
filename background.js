@@ -726,7 +726,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (age < 3500000) {
           sendResponse({ token: data.accessToken });
         } else {
-          chrome.storage.local.remove(['accessToken', 'tokenTime']);
+          // Token expired — return null but do NOT remove from storage.
+          // Removing it triggers storage.onChanged across all tabs,
+          // causing a sign-out cascade. The stale token sits inert until
+          // overwritten by a successful refresh or cleared by explicit sign-out.
           sendResponse({ token: null });
         }
       } else {
@@ -737,16 +740,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'signOut') {
-    // Also revoke the token with Google if possible
-    chrome.storage.local.get(['accessToken'], (data) => {
-      if (data.accessToken) {
-        // Try to revoke the cached Chrome identity token
-        try {
-          chrome.identity.removeCachedAuthToken({ token: data.accessToken }, () => {});
-        } catch (e) {}
-      }
-      chrome.storage.local.remove(['accessToken', 'tokenTime'], () => {
-        sendResponse({ success: true });
+    // Also revoke the token with Google if possible.
+    // Set timestamp so other tabs know this is an explicit sign-out (not token expiry).
+    // Tabs check if this timestamp is within the last 5 seconds to decide behavior.
+    chrome.storage.local.set({ explicitSignOutTime: Date.now() }, () => {
+      chrome.storage.local.get(['accessToken'], (data) => {
+        if (data.accessToken) {
+          // Try to revoke the cached Chrome identity token
+          try {
+            chrome.identity.removeCachedAuthToken({ token: data.accessToken }, () => {});
+          } catch (e) {}
+        }
+        chrome.storage.local.remove(['accessToken', 'tokenTime'], () => {
+          sendResponse({ success: true });
+        });
       });
     });
     return true;
