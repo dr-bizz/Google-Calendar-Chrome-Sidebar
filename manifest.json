@@ -1,30 +1,21 @@
 {
   "manifest_version": 3,
   "name": "Google Calendar Side Panel",
-  "version": "7.0",
+  "version": "8.0",
   "short_name": "Cal Panel",
   "description": "Always-visible Google Calendar in your browser's side panel",
   "permissions": [
     "sidePanel",
     "storage",
     "tabs",
-    "identity",
     "alarms",
     "notifications"
   ],
   "host_permissions": [
     "https://www.googleapis.com/*",
-    "https://accounts.google.com/*",
     "https://api.github.com/*",
-    "https://github-token-exchange.dr-bizz.workers.dev/*"
+    "https://auth-token-exchange.dr-bizz.workers.dev/*"
   ],
-  "oauth2": {
-    "client_id": "213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com",
-    "scopes": [
-      "https://www.googleapis.com/auth/calendar.events",
-      "https://www.googleapis.com/auth/calendar.readonly"
-    ]
-  },
   "side_panel": {
     "default_path": "sidepanel.html"
   },
@@ -47,7 +38,10 @@
   "web_accessible_resources": [
     {
       "resources": ["oauth_callback.html", "oauth_callback.js"],
-      "matches": ["https://accounts.google.com/*"]
+      "matches": [
+        "https://accounts.google.com/*",
+        "https://auth-token-exchange.dr-bizz.workers.dev/*"
+      ]
     }
   ]
 }
