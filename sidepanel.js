@@ -10,7 +10,6 @@
     let countdownInterval = null;
     let showUpcoming = false;
     let miniCalCollapsed = false;
-    let compactMode = false;
     let darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
 
     // ---- GitHub PR State ----
@@ -38,7 +37,6 @@
         if (saved) {
           const p = JSON.parse(saved);
           if (p.darkMode !== undefined) darkMode = p.darkMode;
-          if (p.compactMode !== undefined) compactMode = p.compactMode;
           if (p.miniCalCollapsed !== undefined) miniCalCollapsed = p.miniCalCollapsed;
           if (p.enabledCalendarIds) enabledCalendarIds = new Set(p.enabledCalendarIds);
           if (p.prSectionCollapsed !== undefined) prSectionCollapsed = p.prSectionCollapsed;
@@ -49,18 +47,15 @@
     function savePrefs() {
       try {
         localStorage.setItem('calPrefs', JSON.stringify({
-          darkMode, compactMode, miniCalCollapsed, prSectionCollapsed,
+          darkMode, miniCalCollapsed, prSectionCollapsed,
           enabledCalendarIds: enabledCalendarIds ? [...enabledCalendarIds] : null
         }));
       } catch (e) {}
     }
     function applyPrefs() {
       document.body.classList.toggle('dark', darkMode);
-      document.body.classList.toggle('compact', compactMode);
       const darkBtn = document.getElementById('darkModeBtn');
       if (darkBtn) darkBtn.classList.toggle('active', darkMode);
-      const compactBtn = document.getElementById('compactBtn');
-      if (compactBtn) compactBtn.classList.toggle('active', compactMode);
       const cal = document.getElementById('miniCalendar');
       const toggle = document.getElementById('miniCalToggle');
       if (cal && toggle) {
@@ -74,7 +69,7 @@
       ['setupScreen','authScreen','manualScreen','loadingScreen','mainContent'].forEach(id => {
         document.getElementById(id).style.display = 'none';
       });
-      const toolbarBtns = ['refreshBtn','darkModeBtn','compactBtn','calFilterBtn','daySummaryBtn'];
+      const toolbarBtns = ['refreshBtn','darkModeBtn','calFilterBtn','daySummaryBtn'];
       toolbarBtns.forEach(id => document.getElementById(id).style.display = 'none');
     }
 
@@ -85,7 +80,7 @@
       el.classList.add('screen-fade');
       setTimeout(() => el.classList.remove('screen-fade'), 300);
       if (screenId === 'mainContent') {
-        ['refreshBtn','darkModeBtn','compactBtn','calFilterBtn','daySummaryBtn'].forEach(id => {
+        ['refreshBtn','darkModeBtn','calFilterBtn','daySummaryBtn'].forEach(id => {
           document.getElementById(id).style.display = 'flex';
         });
       }
@@ -2095,7 +2090,16 @@
 
       const urls = await sendMsg({ type: 'getRedirectURLs' });
 
-      const stored = await sendMsg({ type: 'getStoredToken' });
+      let stored = await sendMsg({ type: 'getStoredToken' });
+
+      // If stored token is expired, try silent refresh before giving up
+      if (!stored || !stored.token) {
+        const silent = await sendMsg({ type: 'silentRefresh' });
+        if (silent && silent.token) {
+          stored = { token: silent.token };
+        }
+      }
+
       if (stored && stored.token) {
         authToken = stored.token;
 
@@ -2269,13 +2273,6 @@
       applyPrefs();
       savePrefs();
       renderTimeline(); // re-render with correct colors
-    });
-
-    // Compact mode toggle
-    document.getElementById('compactBtn').addEventListener('click', () => {
-      compactMode = !compactMode;
-      applyPrefs();
-      savePrefs();
     });
 
     // Close specific panels (pass the one to keep open)
