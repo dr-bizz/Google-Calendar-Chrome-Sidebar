@@ -292,23 +292,7 @@
       margin-top: 12px; padding: 10px; background: var(--red-light); border-radius: 4px;
       font-size: 12px; color: var(--red); max-width: 280px; word-break: break-word; text-align: left;
     }
-    .debug-box {
-      margin-top: 12px; padding: 10px; background: var(--hover-bg); border-radius: 4px;
-      font-size: 11px; color: var(--text-secondary); max-width: 280px; word-break: break-all; text-align: left;
-    }
-    .debug-box code { font-family: monospace; font-size: 10px; display: block; margin: 4px 0; background: var(--skeleton); padding: 4px; border-radius: 2px; }
-    .copy-btn {
-      font-size: 10px; color: var(--primary); background: none; border: 1px solid var(--border);
-      padding: 2px 8px; border-radius: 3px; cursor: pointer; margin-top: 4px;
-    }
-    .copy-btn:hover { background: var(--primary-light); }
-
     .empty-day { padding: 16px 0; text-align: center; font-size: 12px; color: var(--text-muted); }
-
-    .setup-steps { text-align: left; font-size: 12px; color: var(--text-secondary); line-height: 1.6; margin: 12px 0; max-width: 280px; }
-    .setup-steps li { margin-bottom: 6px; }
-
-    .token-input { width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 12px; margin: 8px 0; font-family: monospace; background: var(--surface); color: var(--text); }
 
     /* ---- Day summary card ---- */
     .day-summary-panel { display: none; }
@@ -892,14 +876,6 @@
     </div>
   </div>
 
-  <!-- SCREEN: Setup needed -->
-  <div id="setupScreen" class="state-screen" style="display:none;">
-    <div class="state-icon">🔧</div>
-    <div class="state-title">Setup Required</div>
-    <div class="state-desc">You need to add your Google Cloud Client ID to use this extension.</div>
-    <div class="debug-box" id="setupInfo"></div>
-  </div>
-
   <!-- SCREEN: Auth -->
   <div id="authScreen" class="state-screen">
     <div class="state-icon">📅</div>
@@ -907,27 +883,6 @@
     <div class="state-desc">Sign in with your Google account to see your calendar events.</div>
     <button class="btn-primary" id="signInBtn">Sign in with Google</button>
     <div id="authError" class="error-box" style="display:none;"></div>
-    <div id="authDebug" class="debug-box" style="display:none;"></div>
-    <button class="btn-secondary" id="showManualBtn" style="margin-top:16px;font-size:11px;">Having trouble? Enter token manually</button>
-  </div>
-
-  <!-- SCREEN: Manual token entry -->
-  <div id="manualScreen" class="state-screen" style="display:none;">
-    <div class="state-icon">🔑</div>
-    <div class="state-title">Manual Token Entry</div>
-    <div class="state-desc">If automatic sign-in doesn't work, you can get a token manually:</div>
-    <ol class="setup-steps">
-      <li>Click the button below to open Google's auth page</li>
-      <li>Sign in and click "Allow"</li>
-      <li>You'll be redirected — copy the <b>access_token</b> value from the URL bar</li>
-      <li>Paste it below and click Save</li>
-    </ol>
-    <button class="btn-secondary" id="openAuthPageBtn">Open Google Auth Page</button>
-    <input type="text" class="token-input" id="manualTokenInput" placeholder="Paste your access_token here..." />
-    <button class="btn-primary" id="saveManualTokenBtn" style="margin-top:4px;">Save Token</button>
-    <button class="btn-secondary" id="backToAuthBtn">Back</button>
-    <div id="manualError" class="error-box" style="display:none;"></div>
-    <div id="manualDebug" class="debug-box" style="display:none;"></div>
   </div>
 
   <!-- SCREEN: Loading (skeleton) -->
