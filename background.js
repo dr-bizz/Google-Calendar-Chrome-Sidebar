@@ -37,7 +37,8 @@ function buildAuthURL(redirectUri, { silent = false } = {}) {
     scope: SCOPES,
     access_type: 'online'
   });
-  if (!silent) params.set('prompt', 'select_account');
+  if (silent) params.set('prompt', 'none');
+  else params.set('prompt', 'select_account');
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 }
 
@@ -81,7 +82,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (alarm.name === 'checkToken' || alarm.name === 'tokenRefresh') {
-    // Proactive token refresh: if token is older than 45 minutes, silently re-auth
+    // Proactive token refresh: if token is older than 45 minutes, silently re-auth.
+    // Uses await so the service worker stays alive until the refresh completes.
     try {
       const data = await chrome.storage.local.get(['tokenTime']);
       if (data.tokenTime) {
@@ -92,22 +94,19 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             const redirectUri = getRedirectURL();
             const authUrl = buildAuthURL(redirectUri, { silent: true });
 
-            chrome.identity.launchWebAuthFlow(
-              { url: authUrl, interactive: false },
-              (responseUrl) => {
-                if (chrome.runtime.lastError || !responseUrl) {
-                  console.log('[Alarms] Silent re-auth failed, letting token expire naturally');
-                  return;
-                }
-                const token = extractTokenFromUrl(responseUrl);
-                if (token) {
-                  console.log('[Alarms] Silent re-auth succeeded');
-                  storeToken(token);
-                }
-              }
+            const responseUrl = await chrome.identity.launchWebAuthFlow(
+              { url: authUrl, interactive: false }
             );
+            if (responseUrl) {
+              const token = extractTokenFromUrl(responseUrl);
+              if (token) {
+                console.log('[Alarms] Silent re-auth succeeded');
+                await storeToken(token);
+              }
+            }
           } catch (e) {
-            console.log('[Alarms] Silent re-auth error, letting token expire naturally');
+            // launchWebAuthFlow rejects when interactive:false can't complete silently
+            console.log('[Alarms] Silent re-auth failed:', e.message || e);
           }
         }
       }
@@ -656,31 +655,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         const redirectUri = getRedirectURL();
         const authUrl = buildAuthURL(redirectUri, { silent: true });
-        let responded = false;
 
-        const timeout = setTimeout(() => {
-          if (!responded) { responded = true; sendResponse({ token: null }); }
-        }, 10000);
+        // Use promise-based API with a timeout race
+        const responseUrl = await Promise.race([
+          chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: false }),
+          new Promise(resolve => setTimeout(() => resolve(null), 10000))
+        ]);
 
-        chrome.identity.launchWebAuthFlow(
-          { url: authUrl, interactive: false },
-          (responseUrl) => {
-            clearTimeout(timeout);
-            if (responded) return;
-            responded = true;
-            if (chrome.runtime.lastError || !responseUrl) {
-              sendResponse({ token: null });
-              return;
-            }
-            const token = extractTokenFromUrl(responseUrl);
-            if (token) {
-              storeToken(token).then(() => sendResponse({ token }));
-            } else {
-              sendResponse({ token: null });
-            }
-          }
-        );
+        if (!responseUrl) {
+          sendResponse({ token: null });
+          return;
+        }
+        const token = extractTokenFromUrl(responseUrl);
+        if (token) {
+          await storeToken(token);
+          sendResponse({ token });
+        } else {
+          sendResponse({ token: null });
+        }
       } catch (e) {
+        // launchWebAuthFlow rejects when interactive:false can't complete silently
         sendResponse({ token: null });
       }
     })();
