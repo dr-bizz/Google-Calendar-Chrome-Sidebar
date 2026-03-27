@@ -66,7 +66,7 @@
 
     // ---- Screen Management ----
     function hideAllScreens() {
-      ['setupScreen','authScreen','manualScreen','loadingScreen','mainContent'].forEach(id => {
+      ['authScreen','loadingScreen','mainContent'].forEach(id => {
         document.getElementById(id).style.display = 'none';
       });
       const toolbarBtns = ['refreshBtn','darkModeBtn','calFilterBtn','daySummaryBtn'];
@@ -89,12 +89,6 @@
     function showError(containerId, msg) {
       const el = document.getElementById(containerId);
       el.textContent = msg;
-      el.style.display = 'block';
-    }
-
-    function showDebug(containerId, info) {
-      const el = document.getElementById(containerId);
-      el.innerHTML = info;
       el.style.display = 'block';
     }
 
@@ -2072,13 +2066,16 @@
     async function init() {
       loadPrefs();
 
-      // Load GitHub state
-      const ghData = await chrome.storage.local.get(['githubToken', 'githubUsername', 'enabledPRRepos']);
-      if (ghData.githubToken) {
-        githubToken = ghData.githubToken;
-        githubUsername = ghData.githubUsername || null;
-        if (ghData.enabledPRRepos) {
-          enabledPRRepos = new Set(ghData.enabledPRRepos);
+      // Load GitHub state from worker-based session token
+      const ghData = await chrome.storage.local.get(['githubSessionToken', 'githubUsername', 'enabledPRRepos']);
+      if (ghData.githubSessionToken) {
+        const ghToken = await sendMsg({ type: 'getGitHubToken' });
+        if (ghToken && ghToken.token) {
+          githubToken = ghToken.token;
+          githubUsername = ghData.githubUsername || null;
+          if (ghData.enabledPRRepos) {
+            enabledPRRepos = new Set(ghData.enabledPRRepos);
+          }
         }
       }
 
@@ -2088,17 +2085,7 @@
         prReviews = cachedPRData.prs;
       }
 
-      const urls = await sendMsg({ type: 'getRedirectURLs' });
-
-      let stored = await sendMsg({ type: 'getStoredToken' });
-
-      // If stored token is expired, try silent refresh before giving up
-      if (!stored || !stored.token) {
-        const silent = await sendMsg({ type: 'silentRefresh' });
-        if (silent && silent.token) {
-          stored = { token: silent.token };
-        }
-      }
+      const stored = await sendMsg({ type: 'getStoredToken' });
 
       if (stored && stored.token) {
         authToken = stored.token;
@@ -2124,12 +2111,11 @@
           // Start GitHub PR polling if connected
           if (githubToken) {
             if (githubUsername) {
-              fetchPRReviews();
+              await fetchPRReviews();
               startPRPolling();
             } else {
-              validateGitHubToken().then(valid => {
-                if (valid) { fetchPRReviews(); startPRPolling(); }
-              });
+              const valid = await validateGitHubToken();
+              if (valid) { await fetchPRReviews(); startPRPolling(); }
             }
           }
         }
@@ -2141,26 +2127,12 @@
       // Start GitHub PR polling even without Google auth (they are independent)
       if (githubToken) {
         if (githubUsername) {
-          fetchPRReviews();
+          await fetchPRReviews();
           startPRPolling();
         } else {
-          validateGitHubToken().then(valid => {
-            if (valid) { fetchPRReviews(); startPRPolling(); }
-          });
+          const valid = await validateGitHubToken();
+          if (valid) { await fetchPRReviews(); startPRPolling(); }
         }
-      }
-
-      if (urls && urls.redirectUrl) {
-        showDebug('authDebug',
-          `<b>Setup info</b> (add these as Authorized redirect URIs in Google Cloud):<br>
-          <code>${escapeHtml(urls.redirectUrl)}</code>
-          <button class="copy-btn" id="copyRedirectBtn">Copy</button>
-          <br><br>Extension ID: <code>${urls.extensionId || 'unknown'}</code>`
-        );
-        setTimeout(() => {
-          const copyBtn = document.getElementById('copyRedirectBtn');
-          if (copyBtn) copyBtn.addEventListener('click', () => navigator.clipboard.writeText(urls.redirectUrl));
-        }, 0);
       }
     }
 
@@ -2194,58 +2166,6 @@
         showError('authError', `Sign-in failed: ${errMsg}`);
       }
     });
-
-    // Manual token entry
-    document.getElementById('showManualBtn').addEventListener('click', () => {
-      showScreen('manualScreen');
-      sendMsg({ type: 'getRedirectURLs' }).then(urls => {
-        if (urls && urls.redirectUrl) {
-          showDebug('manualDebug',
-            `<b>Redirect URI for Google Cloud:</b><br>
-            <code>${escapeHtml(urls.redirectUrl)}</code>
-            <button class="copy-btn" id="copyRedirectBtn2">Copy</button>`
-          );
-          setTimeout(() => {
-            const copyBtn = document.getElementById('copyRedirectBtn2');
-            if (copyBtn) copyBtn.addEventListener('click', () => navigator.clipboard.writeText(urls.redirectUrl));
-          }, 0);
-        }
-      });
-    });
-
-    document.getElementById('openAuthPageBtn').addEventListener('click', async () => {
-      const urls = await sendMsg({ type: 'getRedirectURLs' });
-      const redirectUri = urls ? urls.redirectUrl : '';
-      const clientId = urls ? urls.clientId : '';
-      const params = new URLSearchParams({
-        client_id: clientId,
-        response_type: 'token',
-        redirect_uri: redirectUri,
-        scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly',
-        prompt: 'consent'
-      });
-      window.open(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`, '_blank');
-    });
-
-    document.getElementById('saveManualTokenBtn').addEventListener('click', async () => {
-      const token = document.getElementById('manualTokenInput').value.trim();
-      if (!token) { showError('manualError', 'Please paste a token first.'); return; }
-      const result = await sendMsg({ type: 'saveManualToken', token });
-      if (result && !result.error) {
-        authToken = token;
-        showScreen('loadingScreen');
-        await loadEvents();
-        if (authToken) {
-          showScreen('mainContent');
-          refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
-        } else {
-          showScreen('manualScreen');
-          showError('manualError', 'Token appears to be invalid.');
-        }
-      }
-    });
-
-    document.getElementById('backToAuthBtn').addEventListener('click', () => showScreen('authScreen'));
 
     // Sign out — clean up all intervals
     document.getElementById('signOutBtn').addEventListener('click', async () => {
@@ -2338,96 +2258,49 @@
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
 
-      if (changes.accessToken) {
-        const newToken = changes.accessToken.newValue;
-        const oldToken = authToken;
+      if (changes.googleSessionToken) {
+        const newSession = changes.googleSessionToken.newValue;
 
-        if (newToken && newToken !== oldToken) {
-          authToken = newToken;
-          clearReAuthBanner();
-
-          // If we're on the auth screen, switch to main and load
-          const authScreenEl = document.getElementById('authScreen');
-          if (authScreenEl && authScreenEl.style.display !== 'none') {
-            showScreen('loadingScreen');
-            loadEvents().then(() => {
-              showScreen('mainContent');
-              if (!refreshInterval) {
-                refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
-              }
-            });
-          }
-        } else if (!newToken && oldToken) {
-          // Token was cleared — check if this is an explicit sign-out or token expiry.
-          // This recovery path is a safety net: the primary recovery mechanism is the
-          // checkToken alarm in background.js which refreshes tokens proactively.
-          // This code handles edge cases where the token is removed from storage
-          // without an explicit sign-out (e.g., external revocation).
-          (async () => {
-            try {
-              const data = await chrome.storage.local.get(['explicitSignOutTime']);
-              const signOutAge = data.explicitSignOutTime
-                ? Date.now() - data.explicitSignOutTime
-                : Infinity;
-
-              if (signOutAge < 5000) {
-                // Explicit sign-out from another tab — sign out this tab too
-                authToken = null;
-                clearAllIntervals();
-                events = [];
-                showToast('Signed out from another tab');
-                showScreen('authScreen');
-                return;
-              }
-
-              // Token expiry — attempt silent recovery
-              console.log('[Auth] Token cleared (not explicit sign-out), attempting silent recovery...');
-
-              // Step 1: Try silent refresh
-              const silent = await sendMsg({ type: 'silentRefresh' });
-              if (silent && silent.token) {
-                console.log('[Auth] Silent recovery succeeded');
-                authToken = silent.token;
-                clearReAuthBanner();
-                return;
-              }
-
-              // Step 2: Check if another tab already refreshed
-              const stored = await sendMsg({ type: 'getStoredToken' });
-              if (stored && stored.token) {
-                console.log('[Auth] Picked up token from another tab');
-                authToken = stored.token;
-                clearReAuthBanner();
-                return;
-              }
-
-              // Step 3: All recovery failed — show re-auth banner (not auth screen)
-              console.log('[Auth] Silent recovery failed, showing re-auth banner');
-              authToken = null;
-              showReAuthBanner();
-            } catch (e) {
-              // Catches extension context invalidation (e.g., extension updated/reloaded).
-              // sendMsg itself never rejects — it resolves with { error: ... } on failure.
-              console.error('[Auth] Recovery error:', e);
-              authToken = null;
-              showReAuthBanner();
+        if (newSession && !authToken) {
+          console.log('[Sync] Google session added from another tab');
+          sendMsg({ type: 'getStoredToken' }).then(stored => {
+            if (stored && stored.token) {
+              authToken = stored.token;
+              clearReAuthBanner();
+              showScreen('loadingScreen');
+              loadEvents().then(() => {
+                showScreen('mainContent');
+                if (!refreshInterval) {
+                  refreshInterval = setInterval(loadEvents, 5 * 60 * 1000);
+                }
+              });
             }
-          })();
+          });
+        } else if (!newSession && authToken) {
+          console.log('[Sync] Google session cleared from another tab');
+          authToken = null;
+          clearAllIntervals();
+          events = [];
+          showScreen('authScreen');
         }
       }
 
-      // GitHub token sync
-      if (changes.githubToken) {
-        const newToken = changes.githubToken.newValue;
-        if (newToken && newToken !== githubToken) {
-          githubToken = newToken;
-          if (!githubUsername) {
-            validateGitHubToken().then(valid => {
-              if (valid) { fetchPRReviews(); startPRPolling(); }
-              renderPRSection();
-            });
-          }
-        } else if (!newToken && githubToken) {
+      // GitHub session token sync
+      if (changes.githubSessionToken) {
+        const newSession = changes.githubSessionToken.newValue;
+        if (newSession && !githubToken) {
+          sendMsg({ type: 'getGitHubToken' }).then(result => {
+            if (result && result.token) {
+              githubToken = result.token;
+              if (!githubUsername) {
+                validateGitHubToken().then(valid => {
+                  if (valid) { fetchPRReviews(); startPRPolling(); }
+                  renderPRSection();
+                });
+              }
+            }
+          });
+        } else if (!newSession && githubToken) {
           githubToken = null;
           githubUsername = null;
           prReviews = [];
@@ -2443,6 +2316,14 @@
         const newRepos = changes.enabledPRRepos.newValue;
         enabledPRRepos = newRepos ? new Set(newRepos) : null;
         renderPRSection();
+      }
+    });
+
+    // ---- Listen for token refresh from background alarm ----
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message.type === 'tokenRefreshed' && message.accessToken) {
+        authToken = message.accessToken;
+        console.log('[Sync] Token refreshed by background alarm');
       }
     });
 
