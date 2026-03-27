@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Google Calendar Side Panel",
-  "version": "6.0",
+  "version": "7.0",
   "short_name": "Cal Panel",
   "description": "Always-visible Google Calendar in your browser's side panel",
   "permissions": [
@@ -14,7 +14,9 @@
   ],
   "host_permissions": [
     "https://www.googleapis.com/*",
-    "https://accounts.google.com/*"
+    "https://accounts.google.com/*",
+    "https://api.github.com/*",
+    "https://github-token-exchange.dr-bizz.workers.dev/*"
   ],
   "oauth2": {
     "client_id": "213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com",

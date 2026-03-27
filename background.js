@@ -2,6 +2,13 @@
 const CLIENT_ID = '213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly';
 
+// ---- GITHUB CONFIG ----
+const GITHUB_CLIENT_ID = 'Ov23liLXcKeNsvuH4dg4';
+const GITHUB_WORKER_URL = 'https://github-token-exchange.dr-bizz.workers.dev';
+// 'repo' scope is required to access private repository PRs via the GitHub API.
+// GitHub does not offer a narrower scope for read-only PR access on private repos.
+const GITHUB_SCOPE = 'repo';
+
 // ---- SIDE PANEL SETUP ----
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
@@ -22,16 +29,21 @@ function getRedirectURL() {
   }
 }
 
-function buildAuthURL(redirectUri) {
+function buildAuthURL(redirectUri, { silent = false } = {}) {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: 'token',
     redirect_uri: redirectUri,
     scope: SCOPES,
-    prompt: 'select_account',
     access_type: 'online'
   });
+  if (silent) params.set('prompt', 'none');
+  else params.set('prompt', 'select_account');
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+function isSafeUrl(url) {
+  try { return new URL(url).protocol === 'https:'; } catch { return false; }
 }
 
 function extractTokenFromUrl(url) {
@@ -54,13 +66,14 @@ async function storeToken(token) {
 }
 
 // ---- ALARMS SETUP ----
-chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
-chrome.alarms.create('checkToken', { periodInMinutes: 1 });
-chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
-chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
-
-// Track which events we've already notified about so we don't spam
-const notifiedEvents = new Set();
+// Create alarms on install/update to avoid resetting timers on every worker wake
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
+  chrome.alarms.create('checkToken', { periodInMinutes: 1 });
+  chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
+  chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
+  chrome.alarms.create('checkPRs', { periodInMinutes: 10 });
+});
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'refreshEvents') {
@@ -69,7 +82,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (alarm.name === 'checkToken' || alarm.name === 'tokenRefresh') {
-    // Proactive token refresh: if token is older than 45 minutes, silently re-auth
+    // Proactive token refresh: if token is older than 45 minutes, silently re-auth.
+    // Uses await so the service worker stays alive until the refresh completes.
     try {
       const data = await chrome.storage.local.get(['tokenTime']);
       if (data.tokenTime) {
@@ -78,31 +92,21 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
           console.log('[Alarms] Token is older than 45 minutes, attempting silent re-auth');
           try {
             const redirectUri = getRedirectURL();
-            const params = new URLSearchParams({
-              client_id: CLIENT_ID,
-              response_type: 'token',
-              redirect_uri: redirectUri,
-              scope: SCOPES,
-              access_type: 'online'
-            });
-            const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+            const authUrl = buildAuthURL(redirectUri, { silent: true });
 
-            chrome.identity.launchWebAuthFlow(
-              { url: authUrl, interactive: false },
-              (responseUrl) => {
-                if (chrome.runtime.lastError || !responseUrl) {
-                  console.log('[Alarms] Silent re-auth failed, letting token expire naturally');
-                  return;
-                }
-                const token = extractTokenFromUrl(responseUrl);
-                if (token) {
-                  console.log('[Alarms] Silent re-auth succeeded');
-                  storeToken(token);
-                }
-              }
+            const responseUrl = await chrome.identity.launchWebAuthFlow(
+              { url: authUrl, interactive: false }
             );
+            if (responseUrl) {
+              const token = extractTokenFromUrl(responseUrl);
+              if (token) {
+                console.log('[Alarms] Silent re-auth succeeded');
+                await storeToken(token);
+              }
+            }
           } catch (e) {
-            console.log('[Alarms] Silent re-auth error, letting token expire naturally');
+            // launchWebAuthFlow rejects when interactive:false can't complete silently
+            console.log('[Alarms] Silent re-auth failed:', e.message || e);
           }
         }
       }
@@ -113,33 +117,36 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
   if (alarm.name === 'checkNotifications') {
     try {
-      const data = await chrome.storage.local.get(['cachedEvents', 'notifPrefs']);
+      const data = await chrome.storage.local.get(['cachedEvents', 'notifPrefs', 'notifiedEventKeys']);
       const prefs = data.notifPrefs || { enabled: true, minutesBefore: 5 };
       if (!prefs.enabled) return;
+
+      // Load persisted notification tracking (survives service worker termination)
+      const notifiedKeys = new Set(data.notifiedEventKeys || []);
 
       if (data.cachedEvents && Array.isArray(data.cachedEvents)) {
         const now = Date.now();
         const minutesBefore = prefs.minutesBefore || 5;
         const windowMs = minutesBefore * 60 * 1000;
+        let changed = false;
 
-        const upcoming = data.cachedEvents
-          .filter(event => event.start && event.start.dateTime)
-          .map(event => ({
-            ...event,
-            startMs: new Date(event.start.dateTime).getTime()
-          }))
-          .filter(event => {
-            const timeUntil = event.startMs - now;
-            // Within the notification window but not already past
-            return timeUntil > 0 && timeUntil <= windowMs;
-          });
+        const upcoming = [];
+        for (const event of data.cachedEvents) {
+          if (!event.start || !event.start.dateTime || !event.end || !event.end.dateTime) continue;
+          const startMs = new Date(event.start.dateTime).getTime();
+          const timeUntil = startMs - now;
+          if (timeUntil > 0 && timeUntil <= windowMs) {
+            upcoming.push({ event, startMs });
+          }
+        }
 
-        upcoming.forEach(event => {
-          const notifKey = `${event.id}-${event.startMs}`;
-          if (notifiedEvents.has(notifKey)) return;
-          notifiedEvents.add(notifKey);
+        for (const { event, startMs } of upcoming) {
+          const notifKey = `${event.id}::${startMs}`;
+          if (notifiedKeys.has(notifKey)) continue;
+          notifiedKeys.add(notifKey);
+          changed = true;
 
-          const minutesUntil = Math.round((event.startMs - now) / 60000);
+          const minutesUntil = Math.round((startMs - now) / 60000);
           const timeText = minutesUntil <= 1 ? 'Starting now' : `In ${minutesUntil} minutes`;
           const startTime = new Date(event.start.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
           const endTime = new Date(event.end.dateTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -150,26 +157,37 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             title: event.summary || '(No title)',
             message: `${timeText} — ${startTime} to ${endTime}`,
             priority: 2,
-            requireInteraction: true
+            requireInteraction: minutesUntil <= 2
           };
 
-          // Add join button if there's a meet link
-          if (event.hangoutLink) {
-            notifOptions.buttons = [
-              { title: 'Join Meeting' },
-              { title: 'Dismiss' }
-            ];
-          }
-
           chrome.notifications.create(notifKey, notifOptions);
+        }
+
+        // Auto-dismiss notifications for events that started 10+ minutes ago
+        chrome.notifications.getAll((active) => {
+          for (const id of Object.keys(active)) {
+            if (id.startsWith('pr::')) continue; // Skip PR notifications
+            const parts = id.split('::');
+            const ts = parseInt(parts[parts.length - 1]);
+            if (ts && now - ts > 10 * 60 * 1000) {
+              chrome.notifications.clear(id);
+            }
+          }
         });
 
-        // Clean up old notified events (older than 1 hour)
-        for (const key of notifiedEvents) {
-          const ts = parseInt(key.split('-').pop());
+        // Clean up old notified keys (older than 1 hour)
+        for (const key of notifiedKeys) {
+          const parts = key.split('::');
+          const ts = parseInt(parts[parts.length - 1]);
           if (ts && now - ts > 3600000) {
-            notifiedEvents.delete(key);
+            notifiedKeys.delete(key);
+            changed = true;
           }
+        }
+
+        // Persist tracking to survive service worker termination
+        if (changed) {
+          await chrome.storage.local.set({ notifiedEventKeys: [...notifiedKeys] });
         }
       }
     } catch (e) {
@@ -178,18 +196,21 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (alarm.name === 'updateBadge') {
-    // Badge support: show upcoming event info on the extension badge
     try {
-      const data = await chrome.storage.local.get(['cachedEvents']);
+      const data = await chrome.storage.local.get(['cachedEvents', 'cachedPRs', 'enabledPRRepos']);
+
+      // Helper: get filtered PR count
+      function getPRCount() {
+        if (!data.cachedPRs || !Array.isArray(data.cachedPRs)) return 0;
+        const enabledRepos = data.enabledPRRepos ? new Set(data.enabledPRRepos) : null;
+        return data.cachedPRs.filter(pr => !enabledRepos || enabledRepos.has(pr.repo)).length;
+      }
+
       if (data.cachedEvents && Array.isArray(data.cachedEvents)) {
         const now = Date.now();
-        // Find the next upcoming timed event (has dateTime, not all-day)
         const upcoming = data.cachedEvents
           .filter(event => event.start && event.start.dateTime)
-          .map(event => ({
-            ...event,
-            startMs: new Date(event.start.dateTime).getTime()
-          }))
+          .map(event => ({ ...event, startMs: new Date(event.start.dateTime).getTime() }))
           .filter(event => event.startMs > now)
           .sort((a, b) => a.startMs - b.startMs);
 
@@ -204,51 +225,194 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             chrome.action.setBadgeText({ text: `${minutesUntil}m` });
             chrome.action.setBadgeBackgroundColor({ color: '#0000FF' });
           } else {
+            const prCount = getPRCount();
+            if (prCount > 0) {
+              chrome.action.setBadgeText({ text: `${prCount}` });
+              chrome.action.setBadgeBackgroundColor({ color: '#8e24aa' });
+            } else {
+              chrome.action.setBadgeText({ text: '' });
+            }
+          }
+        } else {
+          const prCount = getPRCount();
+          if (prCount > 0) {
+            chrome.action.setBadgeText({ text: `${prCount}` });
+            chrome.action.setBadgeBackgroundColor({ color: '#8e24aa' });
+          } else {
             chrome.action.setBadgeText({ text: '' });
           }
+        }
+      } else {
+        const prCount = getPRCount();
+        if (prCount > 0) {
+          chrome.action.setBadgeText({ text: `${prCount}` });
+          chrome.action.setBadgeBackgroundColor({ color: '#8e24aa' });
         } else {
           chrome.action.setBadgeText({ text: '' });
         }
-      } else {
-        chrome.action.setBadgeText({ text: '' });
       }
     } catch (e) {
       console.error('[Alarms] updateBadge error:', e);
     }
   }
+
+  if (alarm.name === 'checkPRs') {
+    try {
+      const data = await chrome.storage.local.get(['githubToken', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'enabledPRRepos']);
+      if (!data.githubToken || !data.githubUsername) return;
+
+      // Deduplication: skip if cache was updated less than 90 seconds ago
+      if (data.prCacheTime && Date.now() - data.prCacheTime < 90000) return;
+
+      // Lightweight search-only fetch (no enrichment)
+      const searchUrl = `https://api.github.com/search/issues?q=type:pr+review-requested:${encodeURIComponent(data.githubUsername)}+is:open&per_page=100`;
+      const response = await fetch(searchUrl, {
+        headers: {
+          'Authorization': `Bearer ${data.githubToken}`,
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+
+      if (response.status === 401) {
+        await chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys']);
+        return;
+      }
+
+      if (response.status === 403) {
+        console.warn('[checkPRs] Rate limited, skipping this cycle');
+        return;
+      }
+
+      if (!response.ok) return;
+
+      const searchData = await response.json();
+      const newPRs = (searchData.items || []).map(item => {
+        const repoFullName = (item.repository_url || '').replace('https://api.github.com/repos/', '');
+        return {
+          id: item.id,
+          repo: repoFullName,
+          title: item.title,
+          number: item.number,
+          htmlUrl: item.html_url,
+          author: { login: item.user?.login, avatarUrl: item.user?.avatar_url },
+        };
+      });
+
+      // Detect new review requests
+      const oldIds = new Set((data.cachedPRs || []).map(pr => pr.id));
+      const notifiedKeys = new Set(data.notifiedPRKeys || []);
+      const enabledRepos = data.enabledPRRepos ? new Set(data.enabledPRRepos) : null;
+      let notifiedChanged = false;
+
+      for (const pr of newPRs) {
+        // Respect repo filter
+        if (enabledRepos && !enabledRepos.has(pr.repo)) continue;
+
+        if (!oldIds.has(pr.id) && !notifiedKeys.has(`pr::${pr.id}`)) {
+          const oldPR = (data.cachedPRs || []).find(p => p.id === pr.id);
+          const isReReview = oldPR ? oldPR.isReReview : false;
+
+          const notifOptions = {
+            type: 'basic',
+            iconUrl: 'icons/icon128.png',
+            title: `${pr.repo} #${pr.number}`,
+            message: `${isReReview ? 'Re-review' : 'Review'} requested: ${pr.title}`,
+            priority: isReReview ? 2 : 1,
+            requireInteraction: isReReview,
+          };
+
+          chrome.notifications.create(`pr::${pr.id}`, notifOptions);
+          notifiedKeys.add(`pr::${pr.id}`);
+          notifiedChanged = true;
+        }
+      }
+
+      // Cleanup: remove notified keys for PRs no longer requesting review
+      const currentIds = new Set(newPRs.map(pr => pr.id));
+      for (const key of notifiedKeys) {
+        if (key.startsWith('pr::')) {
+          const prId = parseInt(key.substring(4));
+          if (!currentIds.has(prId)) {
+            notifiedKeys.delete(key);
+            notifiedChanged = true;
+          }
+        }
+      }
+
+      // Merge new lightweight data with existing enriched cache
+      const mergedPRs = newPRs.map(newPR => {
+        const existing = (data.cachedPRs || []).find(p => p.id === newPR.id);
+        return existing ? { ...existing, ...newPR } : newPR;
+      });
+
+      const updates = { cachedPRs: mergedPRs, prCacheTime: Date.now() };
+      if (notifiedChanged) updates.notifiedPRKeys = [...notifiedKeys];
+      await chrome.storage.local.set(updates);
+
+    } catch (e) {
+      console.error('[Alarms] checkPRs error:', e);
+    }
+  }
 });
 
 // ---- NOTIFICATION HANDLERS ----
-chrome.notifications.onClicked.addListener((notificationId) => {
-  // Find the event's meet link from cached events
+function findEventFromNotification(notificationId, callback) {
   chrome.storage.local.get(['cachedEvents'], (data) => {
-    if (data.cachedEvents) {
-      const eventId = notificationId.substring(0, notificationId.lastIndexOf('-'));
-      const event = data.cachedEvents.find(e => e.id === eventId);
-      if (event && event.hangoutLink) {
-        chrome.tabs.create({ url: event.hangoutLink });
-      } else if (event && event.htmlLink) {
-        chrome.tabs.create({ url: event.htmlLink });
-      }
-    }
+    if (!data.cachedEvents) { callback(null); return; }
+    const delimIdx = notificationId.lastIndexOf('::');
+    const eventId = delimIdx !== -1 ? notificationId.substring(0, delimIdx) : notificationId;
+    const event = data.cachedEvents.find(e => e.id === eventId);
+    callback(event || null);
   });
+}
+
+function openEventUrl(event) {
+  const url = event.hangoutLink || event.htmlLink;
+  if (url && isSafeUrl(url)) {
+    chrome.tabs.create({ url });
+  }
+}
+
+chrome.notifications.onClicked.addListener((notificationId) => {
+  if (notificationId.startsWith('pr::')) {
+    // PR notification — look up the htmlUrl from cached PRs
+    chrome.storage.local.get(['cachedPRs'], (data) => {
+      const prId = parseInt(notificationId.substring(4));
+      const pr = (data.cachedPRs || []).find(p => p.id === prId);
+      if (pr && pr.htmlUrl && isSafeUrl(pr.htmlUrl)) {
+        chrome.tabs.create({ url: pr.htmlUrl });
+      }
+    });
+  } else {
+    // Calendar event notification
+    findEventFromNotification(notificationId, (event) => {
+      if (event) openEventUrl(event);
+    });
+  }
   chrome.notifications.clear(notificationId);
 });
 
 chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
-  if (buttonIndex === 0) {
-    // "Join Meeting" button
-    chrome.storage.local.get(['cachedEvents'], (data) => {
-      if (data.cachedEvents) {
-        const eventId = notificationId.substring(0, notificationId.lastIndexOf('-'));
-        const event = data.cachedEvents.find(e => e.id === eventId);
-        if (event && event.hangoutLink) {
-          chrome.tabs.create({ url: event.hangoutLink });
+  if (notificationId.startsWith('pr::')) {
+    // PR notification button — open in GitHub
+    if (buttonIndex === 0) {
+      chrome.storage.local.get(['cachedPRs'], (data) => {
+        const prId = parseInt(notificationId.substring(4));
+        const pr = (data.cachedPRs || []).find(p => p.id === prId);
+        if (pr && pr.htmlUrl) {
+          chrome.tabs.create({ url: pr.htmlUrl });
         }
+      });
+    }
+  } else if (buttonIndex === 0) {
+    // Calendar event button
+    findEventFromNotification(notificationId, (event) => {
+      if (event && event.hangoutLink && isSafeUrl(event.hangoutLink)) {
+        chrome.tabs.create({ url: event.hangoutLink });
       }
     });
   }
-  // Both buttons dismiss
   chrome.notifications.clear(notificationId);
 });
 
@@ -402,37 +566,115 @@ async function authViaTab() {
   });
 }
 
+// ---- GITHUB AUTH ----
+async function authViaGitHub() {
+  if (GITHUB_CLIENT_ID === 'YOUR_GITHUB_CLIENT_ID' || GITHUB_WORKER_URL.includes('YOUR_SUBDOMAIN')) {
+    return { error: 'GitHub integration not configured. Update GITHUB_CLIENT_ID and GITHUB_WORKER_URL in background.js.' };
+  }
+  return new Promise((resolve) => {
+    const redirectUri = getRedirectURL();
+    const state = crypto.randomUUID();
+    const params = new URLSearchParams({
+      client_id: GITHUB_CLIENT_ID,
+      redirect_uri: redirectUri,
+      scope: GITHUB_SCOPE,
+      state,
+    });
+    const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+
+    console.log('[GitHub Auth] Starting OAuth flow');
+    console.log('[GitHub Auth] Redirect URI:', redirectUri);
+
+    try {
+      chrome.identity.launchWebAuthFlow(
+        { url: authUrl, interactive: true },
+        async (responseUrl) => {
+          if (chrome.runtime.lastError || !responseUrl) {
+            console.warn('[GitHub Auth] Failed:', chrome.runtime.lastError?.message);
+            resolve({ error: chrome.runtime.lastError?.message || 'No response' });
+            return;
+          }
+
+          try {
+            const url = new URL(responseUrl);
+            const code = url.searchParams.get('code');
+            const returnedState = url.searchParams.get('state');
+
+            if (!code) {
+              resolve({ error: 'No authorization code in response' });
+              return;
+            }
+
+            if (returnedState !== state) {
+              resolve({ error: 'State mismatch — possible CSRF attack' });
+              return;
+            }
+
+            // Exchange code for token via Cloudflare Worker
+            const tokenResponse = await fetch(`${GITHUB_WORKER_URL}/github/token`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ code }),
+            });
+
+            const data = await tokenResponse.json();
+            if (data.error) {
+              resolve({ error: data.error });
+              return;
+            }
+
+            if (data.access_token) {
+              console.log('[GitHub Auth] Success!');
+              await chrome.storage.local.set({
+                githubToken: data.access_token,
+                githubTokenTime: Date.now(),
+              });
+              resolve({ token: data.access_token });
+            } else {
+              resolve({ error: 'No access token in worker response' });
+            }
+          } catch (e) {
+            console.error('[GitHub Auth] Token exchange error:', e);
+            resolve({ error: e.message });
+          }
+        }
+      );
+    } catch (e) {
+      console.warn('[GitHub Auth] Exception:', e.message);
+      resolve({ error: e.message });
+    }
+  });
+}
+
 // ---- MESSAGE HANDLING ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
-  // Silent token refresh — non-interactive, no popup
+  // Silent token refresh — non-interactive, no popup, with timeout
   if (message.type === 'silentRefresh') {
     (async () => {
-      console.log('[Auth] Attempting silent (non-interactive) refresh...');
       try {
         const redirectUri = getRedirectURL();
-        const authUrl = buildAuthURL(redirectUri);
+        const authUrl = buildAuthURL(redirectUri, { silent: true });
 
-        chrome.identity.launchWebAuthFlow(
-          { url: authUrl, interactive: false },
-          (responseUrl) => {
-            if (chrome.runtime.lastError || !responseUrl) {
-              console.log('[Auth] Silent refresh failed:', chrome.runtime.lastError?.message || 'no response');
-              sendResponse({ token: null });
-              return;
-            }
-            const token = extractTokenFromUrl(responseUrl);
-            if (token) {
-              console.log('[Auth] Silent refresh succeeded');
-              storeToken(token);
-              sendResponse({ token });
-            } else {
-              sendResponse({ token: null });
-            }
-          }
-        );
+        // Use promise-based API with a timeout race
+        const responseUrl = await Promise.race([
+          chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: false }),
+          new Promise(resolve => setTimeout(() => resolve(null), 10000))
+        ]);
+
+        if (!responseUrl) {
+          sendResponse({ token: null });
+          return;
+        }
+        const token = extractTokenFromUrl(responseUrl);
+        if (token) {
+          await storeToken(token);
+          sendResponse({ token });
+        } else {
+          sendResponse({ token: null });
+        }
       } catch (e) {
-        console.log('[Auth] Silent refresh error:', e.message);
+        // launchWebAuthFlow rejects when interactive:false can't complete silently
         sendResponse({ token: null });
       }
     })();
@@ -478,7 +720,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (age < 3500000) {
           sendResponse({ token: data.accessToken });
         } else {
-          chrome.storage.local.remove(['accessToken', 'tokenTime']);
+          // Token expired — return null but do NOT remove from storage.
+          // Removing it triggers storage.onChanged across all tabs,
+          // causing a sign-out cascade. The stale token sits inert until
+          // overwritten by a successful refresh or cleared by explicit sign-out.
           sendResponse({ token: null });
         }
       } else {
@@ -489,16 +734,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'signOut') {
-    // Also revoke the token with Google if possible
-    chrome.storage.local.get(['accessToken'], (data) => {
-      if (data.accessToken) {
-        // Try to revoke the cached Chrome identity token
-        try {
-          chrome.identity.removeCachedAuthToken({ token: data.accessToken }, () => {});
-        } catch (e) {}
-      }
-      chrome.storage.local.remove(['accessToken', 'tokenTime'], () => {
-        sendResponse({ success: true });
+    // Also revoke the token with Google if possible.
+    // Set timestamp so other tabs know this is an explicit sign-out (not token expiry).
+    // Tabs check if this timestamp is within the last 5 seconds to decide behavior.
+    chrome.storage.local.set({ explicitSignOutTime: Date.now() }, () => {
+      chrome.storage.local.get(['accessToken'], (data) => {
+        if (data.accessToken) {
+          // Try to revoke the cached Chrome identity token
+          try {
+            chrome.identity.removeCachedAuthToken({ token: data.accessToken }, () => {});
+          } catch (e) {}
+        }
+        chrome.storage.local.remove(['accessToken', 'tokenTime'], () => {
+          sendResponse({ success: true });
+        });
       });
     });
     return true;
@@ -513,20 +762,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'saveManualToken') {
     if (message.token) {
-      storeToken(message.token);
-      sendResponse({ success: true });
+      storeToken(message.token).then(() => sendResponse({ success: true }));
     } else {
       sendResponse({ error: 'No token provided' });
     }
-    return false;
+    return true;
   }
 
   if (message.type === 'oauthToken') {
     if (message.token) {
-      storeToken(message.token);
-      sendResponse({ success: true });
+      storeToken(message.token).then(() => sendResponse({ success: true }));
+    } else {
+      sendResponse({ success: false });
     }
-    return false;
+    return true;
   }
 
   // ---- EVENT CACHING MESSAGE HANDLERS ----
@@ -545,6 +794,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({
         events: data.cachedEvents || null,
         cacheTime: data.cacheTime || null
+      });
+    });
+    return true;
+  }
+
+  // ---- GITHUB AUTH MESSAGE HANDLERS ----
+  if (message.type === 'startGitHubAuth') {
+    (async () => {
+      const result = await authViaGitHub();
+      sendResponse(result);
+    })();
+    return true;
+  }
+
+  if (message.type === 'getGitHubToken') {
+    chrome.storage.local.get(['githubToken'], (data) => {
+      sendResponse({ token: data.githubToken || null });
+    });
+    return true;
+  }
+
+  if (message.type === 'disconnectGitHub') {
+    chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'githubUsername'], () => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  // ---- PR CACHING MESSAGE HANDLERS ----
+  if (message.type === 'cachePRs') {
+    chrome.storage.local.set({
+      cachedPRs: message.prs,
+      prCacheTime: Date.now(),
+    }, () => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  if (message.type === 'getCachedPRs') {
+    chrome.storage.local.get(['cachedPRs', 'prCacheTime'], (data) => {
+      sendResponse({
+        prs: data.cachedPRs || null,
+        cacheTime: data.prCacheTime || null,
       });
     });
     return true;

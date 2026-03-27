@@ -1,0 +1,7 @@
+name = "github-token-exchange"
+main = "github-token-exchange.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+GITHUB_CLIENT_ID = "Ov23liLXcKeNsvuH4dg4"
+EXTENSION_ID = "jbjnpfnadckdbdlpihfcgjepokiieojj"
