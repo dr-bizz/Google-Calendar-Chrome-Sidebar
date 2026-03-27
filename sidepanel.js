@@ -2316,8 +2316,10 @@
         document.getElementById('calFilterBtn').classList.remove('active');
       } else {
         calFilterOpen = true;
+        renderCalendarFilter();
         document.getElementById('calFilterPanel').classList.add('open');
         document.getElementById('calFilterBtn').classList.add('active');
+        document.getElementById('mainContent').scrollTop = 0;
       }
     });
 
