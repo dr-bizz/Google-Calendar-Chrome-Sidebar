@@ -466,7 +466,7 @@ async function startGoogleAuth() {
         return;
       }
 
-      const listener = (message, sender, sendResponse) => {
+      const listener = async (message, sender, sendResponse) => {
         if (message.type === 'oauthCallback' && message.provider === 'google') {
           chrome.runtime.onMessage.removeListener(listener);
           clearTimeout(timer);
@@ -605,6 +605,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'oauthCallback') {
+    // Validate sender is our own oauth_callback page
+    if (!sender.url || !sender.url.startsWith(chrome.runtime.getURL('oauth_callback.html'))) {
+      sendResponse({ error: 'Invalid sender' });
+      return true;
+    }
     (async () => {
       if (message.provider === 'google' && message.sessionToken && message.accessToken) {
         await storeGoogleSession(message.sessionToken, message.accessToken);
