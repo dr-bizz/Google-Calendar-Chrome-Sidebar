@@ -94,9 +94,14 @@ function handlePost(handler) {
     }
 
     const result = await handler(body, request, url, env);
-    // Ensure CORS header is present on every response
-    result.headers.set('Access-Control-Allow-Origin', corsOrigin);
-    return result;
+    // Clone response with CORS header to avoid immutable headers issues
+    return new Response(result.body, {
+      status: result.status,
+      headers: {
+        ...Object.fromEntries(result.headers),
+        'Access-Control-Allow-Origin': corsOrigin,
+      },
+    });
   };
 }
 

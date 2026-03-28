@@ -80,6 +80,11 @@ async function retrieveGitHubToken() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_token: data.githubSessionToken }),
     });
+    if (response.status === 401 || response.status === 404) {
+      console.log('[GitHub] Session expired on worker, clearing local session');
+      await chrome.storage.local.remove(['githubSessionToken', 'githubUsername']);
+      return null;
+    }
     const result = await response.json();
     return result.access_token || null;
   } catch (e) {

@@ -52,4 +52,4 @@ Google Calendar Side Panel — a Manifest V3 Chrome extension (also works in Bra
 ## Storage
 
 - **`chrome.storage.local`**: Google session (`googleSessionToken`, `googleAccessToken`, `googleTokenTime`), GitHub session (`githubSessionToken`, `githubUsername`), cached events (`cachedEvents`, `cacheTime`), cached PRs (`cachedPRs`, `prCacheTime`), notification tracking (`notifiedEventKeys`, `notifiedPRKeys`), PR repo filter (`enabledPRRepos`)
-- **`localStorage`**: UI preferences — dark mode, mini calendar collapsed state, enabled calendar IDs, PR section collapsed state
+- **`localStorage`**: UI preferences — dark mode, mini calendar collapsed state, enabled calendar IDs, PR section collapsed state, show upcoming toggle
