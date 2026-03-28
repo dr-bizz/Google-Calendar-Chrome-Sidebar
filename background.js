@@ -40,7 +40,9 @@ async function refreshGoogleToken() {
 
 async function _doRefreshGoogleToken() {
   const data = await chrome.storage.local.get(['googleSessionToken']);
-  if (!data.googleSessionToken) return null;
+  if (!data.googleSessionToken) {
+    return null;
+  }
   try {
     const response = await fetch(`${WORKER_URL}/google/refresh`, {
       method: 'POST',
@@ -69,7 +71,9 @@ async function _doRefreshGoogleToken() {
 
 async function retrieveGitHubToken() {
   const data = await chrome.storage.local.get(['githubSessionToken']);
-  if (!data.githubSessionToken) return null;
+  if (!data.githubSessionToken) {
+    return null;
+  }
   try {
     const response = await fetch(`${WORKER_URL}/github/retrieve`, {
       method: 'POST',
@@ -132,7 +136,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       const data = await chrome.storage.local.get(['googleSessionToken', 'googleTokenTime']);
       if (data.googleSessionToken && data.googleTokenTime) {
         const age = Date.now() - data.googleTokenTime;
-        if (age > 3300000) { // 55 minutes
+        // 55 minutes is a safe threshold to refresh before the typical 1-hour expiry, allowing some buffer for delays
+        if (age > 3300000) {
           console.log('[Alarms] Token older than 55 min, refreshing via worker');
           const accessToken = await refreshGoogleToken();
           if (accessToken) {
@@ -292,14 +297,20 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'checkPRs') {
     try {
       const data = await chrome.storage.local.get(['githubSessionToken', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'enabledPRRepos']);
-      if (!data.githubSessionToken || !data.githubUsername) return;
+      if (!data.githubSessionToken || !data.githubUsername) {
+        return;
+      }
 
       // Deduplication: skip if cache was updated less than 90 seconds ago
-      if (data.prCacheTime && Date.now() - data.prCacheTime < 90000) return;
+      if (data.prCacheTime && Date.now() - data.prCacheTime < 90000) {
+        return;
+      }
 
       // Retrieve GitHub token from worker for this poll cycle
       const ghToken = await retrieveGitHubToken();
-      if (!ghToken) return;
+      if (!ghToken) {
+        return;
+      }
 
       // Lightweight search-only fetch (no enrichment)
       const searchUrl = `https://api.github.com/search/issues?q=type:pr+review-requested:${encodeURIComponent(data.githubUsername)}+is:open&per_page=100`;
@@ -322,7 +333,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         return;
       }
 
-      if (!response.ok) return;
+      if (!response.ok) {
+        return;
+      }
 
       const searchData = await response.json();
       const newPRs = (searchData.items || []).map(item => {
@@ -345,7 +358,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
       for (const pr of newPRs) {
         // Respect repo filter
-        if (enabledRepos && !enabledRepos.has(pr.repo)) continue;
+        if (enabledRepos && !enabledRepos.has(pr.repo)) {
+          continue;
+        }
 
         if (!oldIds.has(pr.id) && !notifiedKeys.has(`pr::${pr.id}`)) {
           const oldPR = (data.cachedPRs || []).find(p => p.id === pr.id);
@@ -397,7 +412,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // ---- NOTIFICATION HANDLERS ----
 function findEventFromNotification(notificationId, callback) {
   chrome.storage.local.get(['cachedEvents'], (data) => {
-    if (!data.cachedEvents) { callback(null); return; }
+    if (!data.cachedEvents) { 
+      callback(null);
+      return;
+    }
     const delimIdx = notificationId.lastIndexOf('::');
     const eventId = delimIdx !== -1 ? notificationId.substring(0, delimIdx) : notificationId;
     const event = data.cachedEvents.find(e => e.id === eventId);
@@ -425,7 +443,9 @@ chrome.notifications.onClicked.addListener((notificationId) => {
   } else {
     // Calendar event notification
     findEventFromNotification(notificationId, (event) => {
-      if (event) openEventUrl(event);
+      if (event) {
+        openEventUrl(event);
+      }
     });
   }
   chrome.notifications.clear(notificationId);
@@ -466,7 +486,7 @@ async function startGoogleAuth() {
         return;
       }
 
-      const listener = async (message, sender, sendResponse) => {
+      const listener = async (message, _sender, sendResponse) => {
         if (message.type === 'oauthCallback' && message.provider === 'google') {
           chrome.runtime.onMessage.removeListener(listener);
           clearTimeout(timer);
@@ -479,7 +499,9 @@ async function startGoogleAuth() {
           } else {
             resolve({ error: 'No session token received' });
           }
-          if (sendResponse) sendResponse({ ok: true });
+          if (sendResponse) {
+            sendResponse({ ok: true });
+          }
         }
       };
 
@@ -515,7 +537,7 @@ async function startGitHubAuth() {
         return;
       }
 
-      const listener = (message, sender, sendResponse) => {
+      const listener = (message, _sender, sendResponse) => {
         if (message.type === 'oauthCallback' && message.provider === 'github') {
           chrome.runtime.onMessage.removeListener(listener);
           clearTimeout(timer);
@@ -528,7 +550,9 @@ async function startGitHubAuth() {
           } else {
             resolve({ error: 'No session token received' });
           }
-          if (sendResponse) sendResponse({ ok: true });
+          if (sendResponse) {
+            sendResponse({ ok: true });
+          }
         }
       };
 
@@ -584,7 +608,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Return cached token if fresh (under 55 minutes old)
       if (data.googleAccessToken && data.googleTokenTime) {
         const age = Date.now() - data.googleTokenTime;
-        if (age < 3300000) { // 55 minutes
+         // 55 minutes is a safe threshold to refresh before the typical 1-hour expiry, allowing some buffer for delays
+        if (age < 3300000) {
           sendResponse({ token: data.googleAccessToken });
           return;
         }

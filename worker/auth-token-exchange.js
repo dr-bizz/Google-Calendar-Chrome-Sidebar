@@ -139,7 +139,7 @@ async function handleGoogleCallback(request, url, env) {
   // Validate CSRF state
   const cookieState = getCookie(request, 'google_oauth_state');
   if (!state || !cookieState || state !== cookieState) {
-    return errorRedirect(env, 'State mismatch – possible CSRF', 'google');
+    return errorRedirect(env, 'State mismatch - possible CSRF', 'google');
   }
 
   if (!code) {
@@ -271,7 +271,7 @@ async function handleGitHubCallback(request, url, env) {
   // Validate CSRF state
   const cookieState = getCookie(request, 'github_oauth_state');
   if (!state || !cookieState || state !== cookieState) {
-    return errorRedirect(env, 'State mismatch – possible CSRF', 'github');
+    return errorRedirect(env, 'State mismatch - possible CSRF', 'github');
   }
 
   if (!code) {

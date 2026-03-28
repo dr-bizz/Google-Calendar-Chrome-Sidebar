@@ -38,7 +38,7 @@
     message.expiresIn = parseInt(expiresIn, 10) || 3600;
   }
 
-  chrome.runtime.sendMessage(message, function(response) {
+  chrome.runtime.sendMessage(message, function(_response) {
     if (chrome.runtime.lastError) {
       const safeMsg = (chrome.runtime.lastError.message || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
       container.innerHTML =
