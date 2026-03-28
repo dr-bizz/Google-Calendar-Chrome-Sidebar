@@ -39,7 +39,6 @@
     {
       "resources": ["oauth_callback.html", "oauth_callback.js"],
       "matches": [
-        "https://accounts.google.com/*",
         "https://auth-token-exchange.dr-bizz.workers.dev/*"
       ]
     }

@@ -9,6 +9,9 @@
   const accessToken = params.get('access_token');
   const expiresIn = params.get('expires_in');
 
+  // Clear sensitive tokens from URL bar and browser history
+  history.replaceState(null, '', window.location.pathname);
+
   if (error) {
     const safeError = error.replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
     container.innerHTML =
