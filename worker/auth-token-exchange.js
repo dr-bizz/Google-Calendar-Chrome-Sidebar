@@ -1,8 +1,9 @@
 export default {
   async fetch(request, env) {
-    const corsOrigin = env.EXTENSION_ID
-      ? `chrome-extension://${env.EXTENSION_ID}`
-      : '*';
+    if (!env.EXTENSION_ID) {
+      return new Response('Server misconfiguration: EXTENSION_ID not set', { status: 500 });
+    }
+    const corsOrigin = `chrome-extension://${env.EXTENSION_ID}`;
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
@@ -166,22 +167,30 @@ async function handleGoogleCallback(request, url, env) {
     return errorRedirect(env, tokenData.error_description || tokenData.error, 'google');
   }
 
+  if (!tokenData.refresh_token) {
+    return errorRedirect(env, 'No refresh token received. Please revoke app access in Google Account settings and try again.', 'google');
+  }
+
   // Store refresh token in KV
-  const sessionToken = crypto.randomUUID();
-  await env.AUTH_TOKENS.put(`google:${sessionToken}`, JSON.stringify({
-    refreshToken: tokenData.refresh_token,
-    createdAt: Date.now(),
-  }));
+  try {
+    const sessionToken = crypto.randomUUID();
+    await env.AUTH_TOKENS.put(`google:${sessionToken}`, JSON.stringify({
+      refreshToken: tokenData.refresh_token,
+      createdAt: Date.now(),
+    }), { expirationTtl: 7776000 });
 
-  // Redirect to extension with session token + access token
-  const fragment = new URLSearchParams({
-    session_token: sessionToken,
-    access_token: tokenData.access_token,
-    expires_in: String(tokenData.expires_in),
-    provider: 'google',
-  }).toString();
+    // Redirect to extension with session token + access token
+    const fragment = new URLSearchParams({
+      session_token: sessionToken,
+      access_token: tokenData.access_token,
+      expires_in: String(tokenData.expires_in),
+      provider: 'google',
+    }).toString();
 
-  return extensionRedirect(env, fragment);
+    return extensionRedirect(env, fragment);
+  } catch (e) {
+    return errorRedirect(env, 'Failed to save session. Please try again.', 'google');
+  }
 }
 
 async function handleGoogleRefresh(body, _request, _url, env) {
@@ -290,19 +299,23 @@ async function handleGitHubCallback(request, url, env) {
   }
 
   // Store access token in KV
-  const sessionToken = crypto.randomUUID();
-  await env.AUTH_TOKENS.put(`github:${sessionToken}`, JSON.stringify({
-    accessToken: tokenData.access_token,
-    createdAt: Date.now(),
-  }));
+  try {
+    const sessionToken = crypto.randomUUID();
+    await env.AUTH_TOKENS.put(`github:${sessionToken}`, JSON.stringify({
+      accessToken: tokenData.access_token,
+      createdAt: Date.now(),
+    }), { expirationTtl: 7776000 });
 
-  // Redirect to extension with session token
-  const fragment = new URLSearchParams({
-    session_token: sessionToken,
-    provider: 'github',
-  }).toString();
+    // Redirect to extension with session token
+    const fragment = new URLSearchParams({
+      session_token: sessionToken,
+      provider: 'github',
+    }).toString();
 
-  return extensionRedirect(env, fragment);
+    return extensionRedirect(env, fragment);
+  } catch (e) {
+    return errorRedirect(env, 'Failed to save session. Please try again.', 'github');
+  }
 }
 
 async function handleGitHubRetrieve(body, _request, _url, env) {
@@ -331,6 +344,10 @@ async function handleRevoke(body, _request, _url, env) {
       status: 400,
       headers: new Headers(),
     });
+  }
+
+  if (provider !== 'google' && provider !== 'github') {
+    return Response.json({ error: 'Invalid provider' }, { status: 400, headers: new Headers() });
   }
 
   const kvKey = `${provider}:${session_token}`;
