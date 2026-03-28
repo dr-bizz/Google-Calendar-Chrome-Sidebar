@@ -1,7 +1,10 @@
-name = "github-token-exchange"
-main = "github-token-exchange.js"
-compatibility_date = "2026-01-01"
+name = "auth-token-exchange"
+main = "auth-token-exchange.js"
+compatibility_date = "2024-01-01"
 
 [vars]
-GITHUB_CLIENT_ID = "Ov23liLXcKeNsvuH4dg4"
-EXTENSION_ID = "jbjnpfnadckdbdlpihfcgjepokiieojj"
+EXTENSION_ID = "fefpaminbjodcadohglcnikaklhbjfgb"
+
+[[kv_namespaces]]
+binding = "AUTH_TOKENS"
+id = "PLACEHOLDER_KV_ID"
