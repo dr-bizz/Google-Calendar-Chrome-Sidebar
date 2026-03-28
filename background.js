@@ -1,5 +1,6 @@
 // ---- CONFIG ----
 const WORKER_URL = 'https://auth-token-exchange.dr-bizz.workers.dev';
+let _refreshPromise = null;
 
 // ---- SIDE PANEL SETUP ----
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -20,6 +21,7 @@ function isSafeUrl(url) {
 async function storeGoogleSession(sessionToken, accessToken) {
   await chrome.storage.local.set({
     googleSessionToken: sessionToken,
+    googleAccessToken: accessToken,
     googleTokenTime: Date.now(),
   });
   chrome.alarms.create('tokenRefresh', { delayInMinutes: 55 });
@@ -27,6 +29,16 @@ async function storeGoogleSession(sessionToken, accessToken) {
 }
 
 async function refreshGoogleToken() {
+  if (_refreshPromise) return _refreshPromise;
+  _refreshPromise = _doRefreshGoogleToken();
+  try {
+    return await _refreshPromise;
+  } finally {
+    _refreshPromise = null;
+  }
+}
+
+async function _doRefreshGoogleToken() {
   const data = await chrome.storage.local.get(['googleSessionToken']);
   if (!data.googleSessionToken) return null;
   try {
@@ -35,9 +47,17 @@ async function refreshGoogleToken() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_token: data.googleSessionToken }),
     });
+    if (response.status === 401 || response.status === 404) {
+      console.log('[Auth] Session expired on worker, clearing local session');
+      await chrome.storage.local.remove(['googleSessionToken', 'googleAccessToken', 'googleTokenTime']);
+      return null;
+    }
     const result = await response.json();
     if (result.access_token) {
-      await chrome.storage.local.set({ googleTokenTime: Date.now() });
+      await chrome.storage.local.set({
+        googleAccessToken: result.access_token,
+        googleTokenTime: Date.now(),
+      });
       return result.access_token;
     }
     return null;
@@ -80,7 +100,7 @@ async function revokeSession(provider) {
     }
   }
   if (provider === 'google') {
-    await chrome.storage.local.remove(['googleSessionToken', 'googleTokenTime']);
+    await chrome.storage.local.remove(['googleSessionToken', 'googleAccessToken', 'googleTokenTime']);
   } else {
     await chrome.storage.local.remove(['githubSessionToken', 'githubUsername']);
   }
@@ -88,12 +108,17 @@ async function revokeSession(provider) {
 
 // ---- ALARMS SETUP ----
 // Create alarms on install/update to avoid resetting timers on every worker wake
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
   chrome.alarms.create('checkToken', { periodInMinutes: 1 });
   chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
   chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
   chrome.alarms.create('checkPRs', { periodInMinutes: 10 });
+
+  // Clean up old storage keys from pre-v8 auth architecture
+  if (details.reason === 'update') {
+    chrome.storage.local.remove(['accessToken', 'tokenTime', 'githubToken', 'githubTokenTime']);
+  }
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -449,7 +474,7 @@ async function startGoogleAuth() {
           try { chrome.tabs.remove(tab.id); } catch (e) {}
 
           if (message.sessionToken && message.accessToken) {
-            storeGoogleSession(message.sessionToken, message.accessToken);
+            await storeGoogleSession(message.sessionToken, message.accessToken);
             resolve({ token: message.accessToken });
           } else {
             resolve({ error: 'No session token received' });
@@ -551,11 +576,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'getStoredToken') {
     (async () => {
-      const data = await chrome.storage.local.get(['googleSessionToken', 'googleTokenTime']);
+      const data = await chrome.storage.local.get(['googleSessionToken', 'googleAccessToken', 'googleTokenTime']);
       if (!data.googleSessionToken) {
         sendResponse({ token: null });
         return;
       }
+      // Return cached token if fresh (under 55 minutes old)
+      if (data.googleAccessToken && data.googleTokenTime) {
+        const age = Date.now() - data.googleTokenTime;
+        if (age < 3300000) { // 55 minutes
+          sendResponse({ token: data.googleAccessToken });
+          return;
+        }
+      }
+      // Token is stale or missing — refresh via worker
       const token = await refreshGoogleToken();
       sendResponse({ token: token || null });
     })();
@@ -564,7 +598,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'signOut') {
     (async () => {
-      await chrome.storage.local.set({ explicitSignOutTime: Date.now() });
       await revokeSession('google');
       sendResponse({ success: true });
     })();
