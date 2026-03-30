@@ -1,12 +1,19 @@
 export default {
   async fetch(request, env) {
-    if (!env.EXTENSION_ID) {
-      return new Response('Server misconfiguration: EXTENSION_ID not set', { status: 500 });
-    }
-    const corsOrigin = `chrome-extension://${env.EXTENSION_ID}`;
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // Derive CORS origin from the request — only allow chrome-extension:// origins
+    const requestOrigin = request.headers.get('Origin') || '';
+    const corsOrigin = requestOrigin.startsWith('chrome-extension://')
+      ? requestOrigin
+      : null;
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
+      if (!corsOrigin) {
+        return new Response('Forbidden', { status: 403 });
+      }
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': corsOrigin,
@@ -16,8 +23,11 @@ export default {
       });
     }
 
-    const url = new URL(request.url);
-    const path = url.pathname;
+    // For GET routes (auth/callback), extract extension ID from query param or cookie
+    // For POST routes, derive from Origin header
+    const extId = url.searchParams.get('ext_id')
+      || getCookie(request, 'ext_id')
+      || (corsOrigin ? corsOrigin.replace('chrome-extension://', '') : null);
 
     // Route table
     const routes = {
@@ -34,16 +44,16 @@ export default {
     if (!handler) {
       return new Response('Not found', {
         status: 404,
-        headers: { 'Access-Control-Allow-Origin': corsOrigin },
+        headers: corsOrigin ? { 'Access-Control-Allow-Origin': corsOrigin } : {},
       });
     }
 
     try {
-      return await handler(request, url, env, corsOrigin);
+      return await handler(request, url, env, corsOrigin, extId);
     } catch (e) {
       return Response.json({ error: 'Internal error' }, {
         status: 500,
-        headers: { 'Access-Control-Allow-Origin': corsOrigin },
+        headers: corsOrigin ? { 'Access-Control-Allow-Origin': corsOrigin } : {},
       });
     }
   },
@@ -59,28 +69,34 @@ function getCookie(request, name) {
   return match ? match.split('=')[1] : null;
 }
 
-function extensionRedirect(env, fragment) {
-  const redirectUrl = `chrome-extension://${env.EXTENSION_ID}/oauth_callback.html#${fragment}`;
+function extensionRedirect(extId, fragment) {
+  if (!extId) {
+    return new Response('Missing extension ID', { status: 400 });
+  }
   return new Response(null, {
     status: 302,
-    headers: { Location: redirectUrl },
+    headers: { Location: `chrome-extension://${extId}/oauth_callback.html#${fragment}` },
   });
 }
 
-function errorRedirect(env, message, provider) {
-  return extensionRedirect(env, `error=${encodeURIComponent(message)}&provider=${provider}`);
+function errorRedirect(extId, message, provider) {
+  return extensionRedirect(extId, `error=${encodeURIComponent(message)}&provider=${provider}`);
 }
 
 /**
  * Wraps a POST-only handler: validates method, parses JSON body, adds CORS.
  */
 function handlePost(handler) {
-  return async (request, url, env, corsOrigin) => {
+  return async (request, url, env, corsOrigin, extId) => {
     if (request.method !== 'POST') {
       return new Response('Method not allowed', {
         status: 405,
-        headers: { 'Access-Control-Allow-Origin': corsOrigin },
+        headers: corsOrigin ? { 'Access-Control-Allow-Origin': corsOrigin } : {},
       });
+    }
+
+    if (!corsOrigin) {
+      return Response.json({ error: 'Forbidden: invalid origin' }, { status: 403 });
     }
 
     let body = {};
@@ -94,7 +110,6 @@ function handlePost(handler) {
     }
 
     const result = await handler(body, request, url, env);
-    // Clone response with CORS header to avoid immutable headers issues
     return new Response(result.body, {
       status: result.status,
       headers: {
@@ -109,7 +124,11 @@ function handlePost(handler) {
 // Google OAuth Routes
 // ---------------------------------------------------------------------------
 
-async function handleGoogleAuth(_request, url, env) {
+async function handleGoogleAuth(_request, url, env, _corsOrigin, extId) {
+  if (!extId) {
+    return new Response('Missing ext_id query parameter', { status: 400 });
+  }
+
   const state = crypto.randomUUID();
   const redirectUri = `${url.origin}/google/callback`;
 
@@ -123,32 +142,37 @@ async function handleGoogleAuth(_request, url, env) {
     state,
   });
 
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}`,
-      'Set-Cookie': `google_oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`,
-    },
+  const headers = new Headers({
+    Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}`,
   });
+  // Store state and extension ID in cookies for the callback
+  headers.append('Set-Cookie', `google_oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`);
+  headers.append('Set-Cookie', `ext_id=${extId}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`);
+
+  return new Response(null, { status: 302, headers });
 }
 
-async function handleGoogleCallback(request, url, env) {
+async function handleGoogleCallback(request, url, env, _corsOrigin, extId) {
   const state = url.searchParams.get('state');
   const code = url.searchParams.get('code');
   const error = url.searchParams.get('error');
 
+  if (!extId) {
+    return new Response('Missing extension ID', { status: 400 });
+  }
+
   if (error) {
-    return errorRedirect(env, error, 'google');
+    return errorRedirect(extId, error, 'google');
   }
 
   // Validate CSRF state
   const cookieState = getCookie(request, 'google_oauth_state');
   if (!state || !cookieState || state !== cookieState) {
-    return errorRedirect(env, 'State mismatch - possible CSRF', 'google');
+    return errorRedirect(extId, 'State mismatch - possible CSRF', 'google');
   }
 
   if (!code) {
-    return errorRedirect(env, 'Missing authorization code', 'google');
+    return errorRedirect(extId, 'Missing authorization code', 'google');
   }
 
   const redirectUri = `${url.origin}/google/callback`;
@@ -169,11 +193,11 @@ async function handleGoogleCallback(request, url, env) {
   const tokenData = await tokenRes.json();
 
   if (tokenData.error) {
-    return errorRedirect(env, tokenData.error_description || tokenData.error, 'google');
+    return errorRedirect(extId, tokenData.error_description || tokenData.error, 'google');
   }
 
   if (!tokenData.refresh_token) {
-    return errorRedirect(env, 'No refresh token received. Please revoke app access in Google Account settings and try again.', 'google');
+    return errorRedirect(extId, 'No refresh token received. Please revoke app access in Google Account settings and try again.', 'google');
   }
 
   // Store refresh token in KV
@@ -184,7 +208,6 @@ async function handleGoogleCallback(request, url, env) {
       createdAt: Date.now(),
     }), { expirationTtl: 7776000 });
 
-    // Redirect to extension with session token + access token
     const fragment = new URLSearchParams({
       session_token: sessionToken,
       access_token: tokenData.access_token,
@@ -192,9 +215,9 @@ async function handleGoogleCallback(request, url, env) {
       provider: 'google',
     }).toString();
 
-    return extensionRedirect(env, fragment);
+    return extensionRedirect(extId, fragment);
   } catch (e) {
-    return errorRedirect(env, 'Failed to save session. Please try again.', 'google');
+    return errorRedirect(extId, 'Failed to save session. Please try again.', 'google');
   }
 }
 
@@ -225,7 +248,6 @@ async function handleGoogleRefresh(body, _request, _url, env) {
   const tokenData = await tokenRes.json();
 
   if (tokenData.error) {
-    // If the refresh token is revoked/expired, clean up the KV entry
     if (tokenData.error === 'invalid_grant') {
       await env.AUTH_TOKENS.delete(`google:${session_token}`);
     }
@@ -245,7 +267,11 @@ async function handleGoogleRefresh(body, _request, _url, env) {
 // GitHub OAuth Routes
 // ---------------------------------------------------------------------------
 
-async function handleGitHubAuth(_request, url, env) {
+async function handleGitHubAuth(_request, url, env, _corsOrigin, extId) {
+  if (!extId) {
+    return new Response('Missing ext_id query parameter', { status: 400 });
+  }
+
   const state = crypto.randomUUID();
 
   const params = new URLSearchParams({
@@ -255,32 +281,36 @@ async function handleGitHubAuth(_request, url, env) {
     state,
   });
 
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: `https://github.com/login/oauth/authorize?${params}`,
-      'Set-Cookie': `github_oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`,
-    },
+  const headers = new Headers({
+    Location: `https://github.com/login/oauth/authorize?${params}`,
   });
+  headers.append('Set-Cookie', `github_oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`);
+  headers.append('Set-Cookie', `ext_id=${extId}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`);
+
+  return new Response(null, { status: 302, headers });
 }
 
-async function handleGitHubCallback(request, url, env) {
+async function handleGitHubCallback(request, url, env, _corsOrigin, extId) {
   const state = url.searchParams.get('state');
   const code = url.searchParams.get('code');
   const error = url.searchParams.get('error');
 
+  if (!extId) {
+    return new Response('Missing extension ID', { status: 400 });
+  }
+
   if (error) {
-    return errorRedirect(env, url.searchParams.get('error_description') || error, 'github');
+    return errorRedirect(extId, url.searchParams.get('error_description') || error, 'github');
   }
 
   // Validate CSRF state
   const cookieState = getCookie(request, 'github_oauth_state');
   if (!state || !cookieState || state !== cookieState) {
-    return errorRedirect(env, 'State mismatch - possible CSRF', 'github');
+    return errorRedirect(extId, 'State mismatch - possible CSRF', 'github');
   }
 
   if (!code) {
-    return errorRedirect(env, 'Missing authorization code', 'github');
+    return errorRedirect(extId, 'Missing authorization code', 'github');
   }
 
   // Exchange code for access token
@@ -300,7 +330,7 @@ async function handleGitHubCallback(request, url, env) {
   const tokenData = await tokenRes.json();
 
   if (tokenData.error) {
-    return errorRedirect(env, tokenData.error_description || tokenData.error, 'github');
+    return errorRedirect(extId, tokenData.error_description || tokenData.error, 'github');
   }
 
   // Store access token in KV
@@ -311,15 +341,14 @@ async function handleGitHubCallback(request, url, env) {
       createdAt: Date.now(),
     }), { expirationTtl: 7776000 });
 
-    // Redirect to extension with session token
     const fragment = new URLSearchParams({
       session_token: sessionToken,
       provider: 'github',
     }).toString();
 
-    return extensionRedirect(env, fragment);
+    return extensionRedirect(extId, fragment);
   } catch (e) {
-    return errorRedirect(env, 'Failed to save session. Please try again.', 'github');
+    return errorRedirect(extId, 'Failed to save session. Please try again.', 'github');
   }
 }
 
@@ -363,7 +392,6 @@ async function handleRevoke(body, _request, _url, env) {
     if (stored) {
       const { refreshToken } = JSON.parse(stored);
       if (refreshToken) {
-        // Best-effort revocation — don't block on failure
         fetch(`https://oauth2.googleapis.com/revoke?token=${refreshToken}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },

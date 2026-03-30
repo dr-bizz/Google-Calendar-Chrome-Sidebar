@@ -482,7 +482,7 @@ chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) =
 // ---- AUTH FUNCTIONS ----
 async function startGoogleAuth() {
   return new Promise((resolve) => {
-    const authUrl = `${WORKER_URL}/google/auth`;
+    const authUrl = `${WORKER_URL}/google/auth?ext_id=${chrome.runtime.id}`;
     console.log('[Google Auth] Opening auth tab:', authUrl);
 
     chrome.tabs.create({ url: authUrl }, (tab) => {
@@ -533,7 +533,7 @@ async function startGoogleAuth() {
 
 async function startGitHubAuth() {
   return new Promise((resolve) => {
-    const authUrl = `${WORKER_URL}/github/auth`;
+    const authUrl = `${WORKER_URL}/github/auth?ext_id=${chrome.runtime.id}`;
     console.log('[GitHub Auth] Opening auth tab:', authUrl);
 
     chrome.tabs.create({ url: authUrl }, (tab) => {

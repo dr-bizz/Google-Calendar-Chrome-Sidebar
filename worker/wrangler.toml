@@ -2,9 +2,6 @@ name = "auth-token-exchange"
 main = "auth-token-exchange.js"
 compatibility_date = "2024-01-01"
 
-[vars]
-EXTENSION_ID = "fefpaminbjodcadohglcnikaklhbjfgb"
-
 [[kv_namespaces]]
 binding = "AUTH_TOKENS"
-id = "PLACEHOLDER_KV_ID"
+id = "a640ce8168ba4668a0b0a8fea257b49e"
