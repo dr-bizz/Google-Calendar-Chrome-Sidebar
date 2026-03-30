@@ -38,6 +38,7 @@ export default {
       '/github/callback': handleGitHubCallback,
       '/github/retrieve': handlePost(handleGitHubRetrieve),
       '/revoke': handlePost(handleRevoke),
+      '/auth/complete': handleAuthComplete,
     };
 
     const handler = routes[path];
@@ -69,37 +70,70 @@ function getCookie(request, name) {
   return match ? match.split('=')[1] : null;
 }
 
-function extensionRedirect(extId, fragment) {
-  if (!extId) {
-    return new Response('Missing extension ID', { status: 400 });
-  }
-  const targetUrl = `chrome-extension://${extId}/oauth_callback.html#${fragment}`;
-  // Serve an intermediate HTML page instead of a 302 redirect.
-  // Brave (and some other browsers) block HTTP redirects to chrome-extension:// URLs.
-  // Client-side navigation via window.location works in all browsers.
-  const html = `<!DOCTYPE html>
-<html><head><title>Completing sign-in...</title>
+function escapeHtml(str) {
+  return str.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/**
+ * Redirect to /auth/complete with session token in query params.
+ * The extension watches for this URL via chrome.tabs.onUpdated and extracts the params.
+ * This avoids navigating to chrome-extension:// which Brave blocks.
+ */
+function authComplete(url, params) {
+  const query = new URLSearchParams(params).toString();
+  return new Response(null, {
+    status: 302,
+    headers: { Location: `${url.origin}/auth/complete?${query}` },
+  });
+}
+
+function authError(url, message, provider) {
+  return authComplete(url, { error: message, provider });
+}
+
+/**
+ * Completion page — shown briefly before the extension closes the tab.
+ * Displays success/error status to the user.
+ */
+async function handleAuthComplete(_request, url) {
+  const error = url.searchParams.get('error');
+  const provider = url.searchParams.get('provider') || '';
+  const label = provider === 'github' ? 'GitHub' : 'Google Calendar';
+
+  if (error) {
+    const html = `<!DOCTYPE html>
+<html lang="en"><head><title>Sign-in failed</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     display: flex; justify-content: center; align-items: center; min-height: 100vh;
     margin: 0; background: #f8f9fa; color: #202124; text-align: center; }
   .container { padding: 40px; }
-  a { color: #1a73e8; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-</style>
-<script>window.location.href = ${JSON.stringify(targetUrl)};</script>
-</head><body><div class="container">
-  <p>Completing sign-in...</p>
-  <p><a href="${targetUrl.replace(/"/g, '&quot;')}">Click here if you are not redirected automatically</a></p>
+  .error { color: #ea4335; font-size: 48px; }
+  p { color: #5f6368; font-size: 14px; }
+</style></head><body><div class="container">
+  <div class="error">&#10007;</div>
+  <h2>Sign-in failed</h2>
+  <p>${escapeHtml(error)}</p>
+  <p>You can close this tab and try again.</p>
 </div></body></html>`;
-  return new Response(html, {
-    status: 200,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
-  });
-}
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  }
 
-function errorRedirect(extId, message, provider) {
-  return extensionRedirect(extId, `error=${encodeURIComponent(message)}&provider=${provider}`);
+  const html = `<!DOCTYPE html>
+<html lang="en"><head><title>Sign-in complete</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    display: flex; justify-content: center; align-items: center; min-height: 100vh;
+    margin: 0; background: #f8f9fa; color: #202124; text-align: center; }
+  .container { padding: 40px; }
+  .success { color: #34a853; font-size: 48px; }
+  p { color: #5f6368; font-size: 14px; }
+</style></head><body><div class="container">
+  <div class="success">&#10003;</div>
+  <h2>Connected to ${escapeHtml(label)}!</h2>
+  <p>This tab will close automatically...</p>
+</div></body></html>`;
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
 /**
@@ -164,7 +198,6 @@ async function handleGoogleAuth(_request, url, env, _corsOrigin, extId) {
   const headers = new Headers({
     Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}`,
   });
-  // Store state and extension ID in cookies for the callback
   headers.append('Set-Cookie', `google_oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`);
   headers.append('Set-Cookie', `ext_id=${extId}; HttpOnly; Secure; SameSite=Lax; Max-Age=600; Path=/`);
 
@@ -181,22 +214,20 @@ async function handleGoogleCallback(request, url, env, _corsOrigin, extId) {
   }
 
   if (error) {
-    return errorRedirect(extId, error, 'google');
+    return authError(url, error, 'google');
   }
 
-  // Validate CSRF state
   const cookieState = getCookie(request, 'google_oauth_state');
   if (!state || !cookieState || state !== cookieState) {
-    return errorRedirect(extId, 'State mismatch - possible CSRF', 'google');
+    return authError(url, 'State mismatch - possible CSRF', 'google');
   }
 
   if (!code) {
-    return errorRedirect(extId, 'Missing authorization code', 'google');
+    return authError(url, 'Missing authorization code', 'google');
   }
 
   const redirectUri = `${url.origin}/google/callback`;
 
-  // Exchange code for tokens
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -212,14 +243,13 @@ async function handleGoogleCallback(request, url, env, _corsOrigin, extId) {
   const tokenData = await tokenRes.json();
 
   if (tokenData.error) {
-    return errorRedirect(extId, tokenData.error_description || tokenData.error, 'google');
+    return authError(url, tokenData.error_description || tokenData.error, 'google');
   }
 
   if (!tokenData.refresh_token) {
-    return errorRedirect(extId, 'No refresh token received. Please revoke app access in Google Account settings and try again.', 'google');
+    return authError(url, 'No refresh token received. Please revoke app access in Google Account settings and try again.', 'google');
   }
 
-  // Store refresh token in KV
   try {
     const sessionToken = crypto.randomUUID();
     await env.AUTH_TOKENS.put(`google:${sessionToken}`, JSON.stringify({
@@ -227,16 +257,14 @@ async function handleGoogleCallback(request, url, env, _corsOrigin, extId) {
       createdAt: Date.now(),
     }), { expirationTtl: 7776000 });
 
-    const fragment = new URLSearchParams({
+    // Redirect to /auth/complete with session token in query params.
+    // Access token is NOT in the URL — extension retrieves it via /google/refresh.
+    return authComplete(url, {
       session_token: sessionToken,
-      access_token: tokenData.access_token,
-      expires_in: String(tokenData.expires_in),
       provider: 'google',
-    }).toString();
-
-    return extensionRedirect(extId, fragment);
+    });
   } catch (e) {
-    return errorRedirect(extId, 'Failed to save session. Please try again.', 'google');
+    return authError(url, 'Failed to save session. Please try again.', 'google');
   }
 }
 
@@ -319,20 +347,18 @@ async function handleGitHubCallback(request, url, env, _corsOrigin, extId) {
   }
 
   if (error) {
-    return errorRedirect(extId, url.searchParams.get('error_description') || error, 'github');
+    return authError(url, url.searchParams.get('error_description') || error, 'github');
   }
 
-  // Validate CSRF state
   const cookieState = getCookie(request, 'github_oauth_state');
   if (!state || !cookieState || state !== cookieState) {
-    return errorRedirect(extId, 'State mismatch - possible CSRF', 'github');
+    return authError(url, 'State mismatch - possible CSRF', 'github');
   }
 
   if (!code) {
-    return errorRedirect(extId, 'Missing authorization code', 'github');
+    return authError(url, 'Missing authorization code', 'github');
   }
 
-  // Exchange code for access token
   const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
     headers: {
@@ -349,10 +375,9 @@ async function handleGitHubCallback(request, url, env, _corsOrigin, extId) {
   const tokenData = await tokenRes.json();
 
   if (tokenData.error) {
-    return errorRedirect(extId, tokenData.error_description || tokenData.error, 'github');
+    return authError(url, tokenData.error_description || tokenData.error, 'github');
   }
 
-  // Store access token in KV
   try {
     const sessionToken = crypto.randomUUID();
     await env.AUTH_TOKENS.put(`github:${sessionToken}`, JSON.stringify({
@@ -360,14 +385,12 @@ async function handleGitHubCallback(request, url, env, _corsOrigin, extId) {
       createdAt: Date.now(),
     }), { expirationTtl: 7776000 });
 
-    const fragment = new URLSearchParams({
+    return authComplete(url, {
       session_token: sessionToken,
       provider: 'github',
-    }).toString();
-
-    return extensionRedirect(extId, fragment);
+    });
   } catch (e) {
-    return errorRedirect(extId, 'Failed to save session. Please try again.', 'github');
+    return authError(url, 'Failed to save session. Please try again.', 'github');
   }
 }
 
@@ -405,7 +428,6 @@ async function handleRevoke(body, _request, _url, env) {
 
   const kvKey = `${provider}:${session_token}`;
 
-  // For Google, also call their revoke endpoint (best-effort)
   if (provider === 'google') {
     const stored = await env.AUTH_TOKENS.get(kvKey);
     if (stored) {

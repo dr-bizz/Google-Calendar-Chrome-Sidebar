@@ -480,10 +480,14 @@ chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) =
 });
 
 // ---- AUTH FUNCTIONS ----
-async function startGoogleAuth() {
+// Shared helper: opens an auth tab and watches for the worker's /auth/complete redirect.
+// The worker redirects to /auth/complete?session_token=...&provider=... after OAuth.
+// We intercept this via chrome.tabs.onUpdated (works in Brave, Chrome, Edge).
+function startOAuthFlow(provider) {
   return new Promise((resolve) => {
-    const authUrl = `${WORKER_URL}/google/auth?ext_id=${chrome.runtime.id}`;
-    console.log('[Google Auth] Opening auth tab:', authUrl);
+    const authUrl = `${WORKER_URL}/${provider}/auth?ext_id=${chrome.runtime.id}`;
+    const completePrefix = `${WORKER_URL}/auth/complete`;
+    console.log(`[${provider} Auth] Opening auth tab:`, authUrl);
 
     chrome.tabs.create({ url: authUrl }, (tab) => {
       if (chrome.runtime.lastError) {
@@ -491,95 +495,78 @@ async function startGoogleAuth() {
         return;
       }
 
-      const listener = async (message, _sender, sendResponse) => {
-        if (message.type === 'oauthCallback' && message.provider === 'google') {
-          chrome.runtime.onMessage.removeListener(listener);
-          clearTimeout(timer);
-          chrome.tabs.onRemoved.removeListener(tabListener);
-          try { chrome.tabs.remove(tab.id); } catch (e) {}
+      function cleanup() {
+        chrome.tabs.onUpdated.removeListener(urlListener);
+        chrome.tabs.onRemoved.removeListener(tabCloseListener);
+        clearTimeout(timer);
+      }
 
-          if (message.sessionToken && message.accessToken) {
-            await storeGoogleSession(message.sessionToken, message.accessToken);
-            resolve({ token: message.accessToken });
-          } else {
-            resolve({ error: 'No session token received' });
-          }
-          if (sendResponse) {
-            sendResponse({ ok: true });
-          }
+      // Watch the tab URL for the /auth/complete redirect
+      const urlListener = (tabId, changeInfo) => {
+        if (tabId !== tab.id || !changeInfo.url) return;
+        if (!changeInfo.url.startsWith(completePrefix)) return;
+
+        cleanup();
+
+        const resultUrl = new URL(changeInfo.url);
+        const error = resultUrl.searchParams.get('error');
+        const sessionToken = resultUrl.searchParams.get('session_token');
+        const resultProvider = resultUrl.searchParams.get('provider');
+
+        // Close the auth tab
+        try { chrome.tabs.remove(tab.id); } catch (e) {}
+
+        if (error) {
+          resolve({ error });
+          return;
+        }
+
+        if (sessionToken && resultProvider) {
+          resolve({ sessionToken, provider: resultProvider });
+        } else {
+          resolve({ error: 'No session token received' });
         }
       };
 
-      chrome.runtime.onMessage.addListener(listener);
+      chrome.tabs.onUpdated.addListener(urlListener);
 
       const timer = setTimeout(() => {
-        chrome.runtime.onMessage.removeListener(listener);
-        chrome.tabs.onRemoved.removeListener(tabListener);
-        resolve({ error: 'Auth timed out after 5 minutes' });
+        cleanup();
+        resolve({ error: 'Sign-in timed out. Please try again.' });
       }, 300000);
 
-      const tabListener = (tabId) => {
+      const tabCloseListener = (tabId) => {
         if (tabId === tab.id) {
-          chrome.tabs.onRemoved.removeListener(tabListener);
-          chrome.runtime.onMessage.removeListener(listener);
-          clearTimeout(timer);
-          setTimeout(() => resolve({ error: 'Auth tab was closed' }), 500);
+          cleanup();
+          setTimeout(() => resolve({ error: 'Sign-in was cancelled.' }), 500);
         }
       };
-      chrome.tabs.onRemoved.addListener(tabListener);
+      chrome.tabs.onRemoved.addListener(tabCloseListener);
     });
   });
 }
 
+async function startGoogleAuth() {
+  const result = await startOAuthFlow('google');
+  if (result.error) return result;
+
+  // Store session token first so refreshGoogleToken() can read it
+  await chrome.storage.local.set({ googleSessionToken: result.sessionToken });
+
+  // Fetch access token via /google/refresh using the session token
+  const accessToken = await refreshGoogleToken();
+  if (accessToken) {
+    return { token: accessToken };
+  }
+  return { error: 'Failed to retrieve access token' };
+}
+
 async function startGitHubAuth() {
-  return new Promise((resolve) => {
-    const authUrl = `${WORKER_URL}/github/auth?ext_id=${chrome.runtime.id}`;
-    console.log('[GitHub Auth] Opening auth tab:', authUrl);
+  const result = await startOAuthFlow('github');
+  if (result.error) return result;
 
-    chrome.tabs.create({ url: authUrl }, (tab) => {
-      if (chrome.runtime.lastError) {
-        resolve({ error: 'Failed to open auth tab: ' + chrome.runtime.lastError.message });
-        return;
-      }
-
-      const listener = (message, _sender, sendResponse) => {
-        if (message.type === 'oauthCallback' && message.provider === 'github') {
-          chrome.runtime.onMessage.removeListener(listener);
-          clearTimeout(timer);
-          chrome.tabs.onRemoved.removeListener(tabListener);
-          try { chrome.tabs.remove(tab.id); } catch (e) {}
-
-          if (message.sessionToken) {
-            chrome.storage.local.set({ githubSessionToken: message.sessionToken });
-            resolve({ sessionToken: message.sessionToken });
-          } else {
-            resolve({ error: 'No session token received' });
-          }
-          if (sendResponse) {
-            sendResponse({ ok: true });
-          }
-        }
-      };
-
-      chrome.runtime.onMessage.addListener(listener);
-
-      const timer = setTimeout(() => {
-        chrome.runtime.onMessage.removeListener(listener);
-        chrome.tabs.onRemoved.removeListener(tabListener);
-        resolve({ error: 'Auth timed out after 5 minutes' });
-      }, 300000);
-
-      const tabListener = (tabId) => {
-        if (tabId === tab.id) {
-          chrome.tabs.onRemoved.removeListener(tabListener);
-          chrome.runtime.onMessage.removeListener(listener);
-          clearTimeout(timer);
-          setTimeout(() => resolve({ error: 'Auth tab was closed' }), 500);
-        }
-      };
-      chrome.tabs.onRemoved.addListener(tabListener);
-    });
-  });
+  await chrome.storage.local.set({ githubSessionToken: result.sessionToken });
+  return { sessionToken: result.sessionToken };
 }
 
 // ---- MESSAGE HANDLING ----
@@ -630,26 +617,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       await revokeSession('google');
       sendResponse({ success: true });
-    })();
-    return true;
-  }
-
-  if (message.type === 'oauthCallback') {
-    // Validate sender is our own oauth_callback page
-    if (!sender.url || !sender.url.startsWith(chrome.runtime.getURL('oauth_callback.html'))) {
-      sendResponse({ error: 'Invalid sender' });
-      return true;
-    }
-    (async () => {
-      if (message.provider === 'google' && message.sessionToken && message.accessToken) {
-        await storeGoogleSession(message.sessionToken, message.accessToken);
-        sendResponse({ success: true });
-      } else if (message.provider === 'github' && message.sessionToken) {
-        await chrome.storage.local.set({ githubSessionToken: message.sessionToken });
-        sendResponse({ success: true });
-      } else {
-        sendResponse({ error: 'Invalid callback data' });
-      }
     })();
     return true;
   }
