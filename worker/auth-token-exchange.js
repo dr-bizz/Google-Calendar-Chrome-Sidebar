@@ -73,9 +73,28 @@ function extensionRedirect(extId, fragment) {
   if (!extId) {
     return new Response('Missing extension ID', { status: 400 });
   }
-  return new Response(null, {
-    status: 302,
-    headers: { Location: `chrome-extension://${extId}/oauth_callback.html#${fragment}` },
+  const targetUrl = `chrome-extension://${extId}/oauth_callback.html#${fragment}`;
+  // Serve an intermediate HTML page instead of a 302 redirect.
+  // Brave (and some other browsers) block HTTP redirects to chrome-extension:// URLs.
+  // Client-side navigation via window.location works in all browsers.
+  const html = `<!DOCTYPE html>
+<html><head><title>Completing sign-in...</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    display: flex; justify-content: center; align-items: center; min-height: 100vh;
+    margin: 0; background: #f8f9fa; color: #202124; text-align: center; }
+  .container { padding: 40px; }
+  a { color: #1a73e8; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+<script>window.location.href = ${JSON.stringify(targetUrl)};</script>
+</head><body><div class="container">
+  <p>Completing sign-in...</p>
+  <p><a href="${targetUrl.replace(/"/g, '&quot;')}">Click here if you are not redirected automatically</a></p>
+</div></body></html>`;
+  return new Response(html, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
   });
 }
 
