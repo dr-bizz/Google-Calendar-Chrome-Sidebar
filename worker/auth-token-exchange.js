@@ -116,7 +116,11 @@ async function handleAuthComplete(_request, url) {
   <p>${escapeHtml(error)}</p>
   <p>You can close this tab and try again.</p>
 </div></body></html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    return new Response(html, { headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Referrer-Policy': 'no-referrer',
+      'Cache-Control': 'no-store',
+    } });
   }
 
   const html = `<!DOCTYPE html>
@@ -133,7 +137,11 @@ async function handleAuthComplete(_request, url) {
   <h2>Connected to ${escapeHtml(label)}!</h2>
   <p>This tab will close automatically...</p>
 </div></body></html>`;
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response(html, { headers: {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Referrer-Policy': 'no-referrer',
+    'Cache-Control': 'no-store',
+  } });
 }
 
 /**
@@ -240,6 +248,10 @@ async function handleGoogleCallback(request, url, env, _corsOrigin, extId) {
     }),
   });
 
+  if (!tokenRes.ok) {
+    return authError(url, 'Token exchange failed', 'google');
+  }
+
   const tokenData = await tokenRes.json();
 
   if (tokenData.error) {
@@ -291,6 +303,10 @@ async function handleGoogleRefresh(body, _request, _url, env) {
       grant_type: 'refresh_token',
     }),
   });
+
+  if (!tokenRes.ok) {
+    return Response.json({ error: 'Token refresh failed' }, { status: 502, headers: new Headers() });
+  }
 
   const tokenData = await tokenRes.json();
 
@@ -371,6 +387,10 @@ async function handleGitHubCallback(request, url, env, _corsOrigin, extId) {
       code,
     }),
   });
+
+  if (!tokenRes.ok) {
+    return authError(url, 'Token exchange failed', 'github');
+  }
 
   const tokenData = await tokenRes.json();
 

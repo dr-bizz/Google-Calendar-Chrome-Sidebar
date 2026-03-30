@@ -15,21 +15,19 @@ Google Calendar Side Panel — a Manifest V3 Chrome extension (also works in Bra
 
 ## Architecture
 
-**Five source files + one external worker:**
+**Four source files + one external worker:**
 
-- **`background.js`** (service worker) — OAuth coordination (opens worker auth URLs, listens for callback messages), token lifecycle management (caching access tokens locally, refreshing via worker, deduplicating concurrent refreshes), background alarms (badge update, event refresh, notification checks, PR polling every 10 min), and message handling between sidepanel and APIs.
+- **`background.js`** (service worker) — OAuth coordination (opens worker auth URLs, watches tab URLs via `chrome.tabs.onUpdated` for `/auth/complete` redirects), token lifecycle management (caching access tokens locally, refreshing via worker, deduplicating concurrent refreshes), background alarms (badge update, event refresh, notification checks, PR polling every 10 min), and message handling between sidepanel and APIs.
 
 - **`sidepanel.js`** — All UI logic: fetches events from Google Calendar API v3 and PRs from GitHub REST API, renders mini calendar, timeline, event cards, day summary, RSVP handling, PR review cards, PR detail slide-out, meeting alerts. Manages preferences via `localStorage`. Polls PRs every 2 minutes when panel is open.
 
 - **`sidepanel.html`** — Markup and embedded CSS (light/dark themes via CSS variables, animations, responsive layout). All styles are inline in a single `<style>` tag.
 
-- **`oauth_callback.js` + `oauth_callback.html`** — Multi-provider OAuth redirect handler. Receives session tokens (and access tokens for Google) from the worker redirect, clears URL fragment for security, and sends an `oauthCallback` message to background.js.
-
-- **`worker/auth-token-exchange.js`** — Unified Cloudflare Worker handling both Google and GitHub OAuth. Routes: `/google/auth`, `/google/callback`, `/google/refresh`, `/github/auth`, `/github/callback`, `/github/retrieve`, `/revoke`. Stores Google refresh tokens and GitHub access tokens in Cloudflare KV. Returns opaque session tokens to the extension. CORS restricted to the extension origin. Deployed separately to Cloudflare Workers.
+- **`worker/auth-token-exchange.js`** — Unified Cloudflare Worker handling both Google and GitHub OAuth. Routes: `/google/auth`, `/google/callback`, `/google/refresh`, `/github/auth`, `/github/callback`, `/github/retrieve`, `/revoke`, `/auth/complete`. Stores Google refresh tokens and GitHub access tokens in Cloudflare KV. Returns opaque session tokens to the extension. CORS restricted to the extension origin. Deployed separately to Cloudflare Workers.
 
 **Data flow:**
-- **Calendar:** User clicks Sign In → background.js opens tab to worker `/google/auth` → worker redirects to Google consent → Google redirects back to worker `/google/callback` → worker exchanges code for tokens, stores refresh token in KV → worker redirects to extension `oauth_callback.html` with session token + access token → background.js stores session token and caches access token → sidepanel.js calls Google Calendar API directly with cached access token → renders UI. Access token refreshed via worker every 55 minutes.
-- **GitHub PRs:** User clicks Connect GitHub → same tab-based flow through worker → session token stored locally → sidepanel.js retrieves access token from worker on panel open, caches in memory → fetches from GitHub Search API → enriches with PR details, reviews, and timeline → renders PR cards. background.js handles 10-min background polling, desktop notifications for new review requests, and badge updates.
+- **Calendar:** User clicks Sign In → background.js opens tab to worker `/google/auth` → worker redirects to Google consent → Google redirects back to worker `/google/callback` → worker exchanges code for tokens, stores refresh token in KV → worker redirects to its own `/auth/complete` page with session token in query params → extension's top-level `chrome.tabs.onUpdated` listener detects the `/auth/complete` URL, extracts session token, then calls `/google/refresh` to get an access token → sidepanel.js calls Google Calendar API directly with cached access token → renders UI. Access token refreshed via worker every 55 minutes.
+- **GitHub PRs:** User clicks Connect GitHub → same tab-based flow through worker → worker redirects to `/auth/complete` with session token → extension extracts session token via `chrome.tabs.onUpdated` → sidepanel.js retrieves access token from worker on panel open, caches in memory → fetches from GitHub Search API → enriches with PR details, reviews, and timeline → renders PR cards. background.js handles 10-min background polling, desktop notifications for new review requests, and badge updates.
 
 ## Key Configuration
 

@@ -11,21 +11,37 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       await chrome.sidePanel.setOptions({ tabId, path: 'sidepanel.html', enabled: true });
     } catch (e) {}
   }
+
+  // Catch OAuth completion if service worker restarted during auth flow
+  if (changeInfo.url && changeInfo.url.includes('/auth/complete')) {
+    try {
+      const resultUrl = new URL(changeInfo.url);
+      const sessionToken = resultUrl.searchParams.get('session_token');
+      const provider = resultUrl.searchParams.get('provider');
+      const error = resultUrl.searchParams.get('error');
+
+      if (error || !sessionToken || !provider) {
+        try { chrome.tabs.remove(tabId); } catch (e) {}
+        return;
+      }
+
+      if (provider === 'google') {
+        await chrome.storage.local.set({ googleSessionToken: sessionToken });
+        await refreshGoogleToken();
+      } else if (provider === 'github') {
+        await chrome.storage.local.set({ githubSessionToken: sessionToken });
+      }
+
+      try { chrome.tabs.remove(tabId); } catch (e) {}
+    } catch (e) {
+      console.error('[Auth] Error processing auth completion:', e);
+    }
+  }
 });
 
 // ---- HELPERS ----
 function isSafeUrl(url) {
   try { return new URL(url).protocol === 'https:'; } catch { return false; }
-}
-
-async function storeGoogleSession(sessionToken, accessToken) {
-  await chrome.storage.local.set({
-    googleSessionToken: sessionToken,
-    googleAccessToken: accessToken,
-    googleTokenTime: Date.now(),
-  });
-  chrome.alarms.create('tokenRefresh', { delayInMinutes: 55 });
-  return accessToken;
 }
 
 async function refreshGoogleToken() {
@@ -54,12 +70,17 @@ async function _doRefreshGoogleToken() {
       await chrome.storage.local.remove(['googleSessionToken', 'googleAccessToken', 'googleTokenTime']);
       return null;
     }
+    if (!response.ok) {
+      console.log('[Auth] Token refresh failed with status:', response.status);
+      return null;
+    }
     const result = await response.json();
     if (result.access_token) {
       await chrome.storage.local.set({
         googleAccessToken: result.access_token,
         googleTokenTime: Date.now(),
       });
+      chrome.alarms.create('tokenRefresh', { delayInMinutes: 55 });
       return result.access_token;
     }
     return null;
@@ -83,6 +104,10 @@ async function retrieveGitHubToken() {
     if (response.status === 401 || response.status === 404) {
       console.log('[GitHub] Session expired on worker, clearing local session');
       await chrome.storage.local.remove(['githubSessionToken', 'githubUsername']);
+      return null;
+    }
+    if (!response.ok) {
+      console.log('[GitHub] Token retrieval failed with status:', response.status);
       return null;
     }
     const result = await response.json();
