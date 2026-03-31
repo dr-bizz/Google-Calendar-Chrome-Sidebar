@@ -80,72 +80,17 @@ See [PRIVACY.md](PRIVACY.md) for the full policy.
 
 If you want to contribute to this project or run your own instance (e.g., you're outside the Cru organization), you'll need to set up your own Cloudflare Worker and Google Cloud project.
 
-### Prerequisites
-
-- Chrome, Brave, or Edge browser
-- [Node.js](https://nodejs.org) installed
-- A [Google Cloud](https://console.cloud.google.com/) account (free)
-- A [Cloudflare](https://cloudflare.com) account (free tier)
-- *(Optional)* A [GitHub](https://github.com) account for PR review integration
-
-### Step 1: Load the Extension
+### Getting Started
 
 1. Clone this repository
 2. Open `chrome://extensions` (or `brave://extensions` / `edge://extensions`)
 3. Enable **Developer mode** (top-right toggle)
 4. Click **Load unpacked** and select the project folder
+5. Click the extension icon → **Sign in with Google** → sign in and approve
+
+Auth uses the shared production worker — no Google Cloud or Cloudflare setup needed. Any unpacked extension ID works automatically.
 
 > **Tip:** Never remove and re-add the extension — it changes the Extension ID. Use the **reload** button instead.
-
-### Step 2: Set Up Google OAuth
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a new project
-2. Enable the **Google Calendar API** in the [API Library](https://console.cloud.google.com/apis/library)
-3. Configure the [OAuth consent screen](https://console.cloud.google.com/auth/overview):
-   - Set to **External**
-   - Add your email as a test user
-   - Add the `calendar.events` and `calendar.readonly` scopes
-4. Create an [OAuth client](https://console.cloud.google.com/auth/clients) → **Web application**
-5. Under **Authorized redirect URIs**, add: `https://YOUR-WORKER.YOUR-ACCOUNT.workers.dev/google/callback`
-6. Copy the **Client ID** and **Client Secret**
-
-### Step 3: Set Up GitHub OAuth (Optional)
-
-1. Go to [GitHub Developer Settings](https://github.com/settings/developers) → **New OAuth App**
-2. Set **Authorization callback URL** to: `https://YOUR-WORKER.YOUR-ACCOUNT.workers.dev/github/callback`
-3. Copy the **Client ID** and generate a **Client Secret**
-
-### Step 4: Deploy the Worker
-
-```bash
-cd worker
-npm install -g wrangler       # if not already installed
-wrangler login                # authenticate with Cloudflare
-wrangler kv namespace create "AUTH_TOKENS"
-```
-
-Update `worker/wrangler.toml` with the KV namespace `id` from the output above.
-
-Deploy and set secrets:
-
-```bash
-npx wrangler deploy
-npx wrangler secret put GOOGLE_CLIENT_ID
-npx wrangler secret put GOOGLE_CLIENT_SECRET
-npx wrangler secret put GITHUB_CLIENT_ID      # optional
-npx wrangler secret put GITHUB_CLIENT_SECRET   # optional
-```
-
-### Step 5: Update Extension Config
-
-1. Open `background.js` — update `WORKER_URL` on line 2 to your deployed worker URL
-2. Open `manifest.json` — update the worker domain in `host_permissions`
-
-### Step 6: Reload and Test
-
-1. Go to `chrome://extensions` and click **reload**
-2. Open the side panel and click **Sign in with Google**
-3. *(If GitHub configured)* Click **Connect GitHub**
 
 ### Development Workflow
 
@@ -200,6 +145,10 @@ This means:
 | Auth flow, token refresh, badge | `background.js` |
 | OAuth token exchange, KV storage | `worker/auth-token-exchange.js` |
 | Permissions, metadata | `manifest.json` |
+
+### Forking with Your Own Worker
+
+If you're forking this project and want to run your own auth infrastructure, see the [worker deployment guide](docs/superpowers/specs/2026-03-27-unified-oauth-worker-design.md) for full details on setting up Google Cloud OAuth, GitHub OAuth, and Cloudflare Worker deployment.
 
 ## License
 
