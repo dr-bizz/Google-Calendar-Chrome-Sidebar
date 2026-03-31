@@ -87,8 +87,6 @@ See [PRIVACY.md](PRIVACY.md) for the full policy.
 
 ## Developer Setup
 
-If you want to contribute to this project or run your own instance (e.g., you're outside the Cru organization), you'll need to set up your own Cloudflare Worker and Google Cloud project.
-
 ### Getting Started
 
 1. Clone this repository
