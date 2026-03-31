@@ -31,20 +31,30 @@ A Chrome/Brave/Edge extension that displays your Google Calendar in the browser'
 
 ## Install
 
-### From the Chrome Web Store
+### Recommended: Load from Source (latest features)
 
-> **Note:** Google OAuth is currently approved for Cru organization accounts. External access is pending Google's verification review. If you're outside Cru, see [Developer Setup](#developer-setup) below to run your own instance.
+Chrome Web Store updates can take up to 2 weeks to approve, so loading from source gets you the latest features immediately.
 
-1. Install from the [Chrome Web Store](https://chromewebstore.google.com/detail/fefpaminbjodcadohglcnikaklhbjfgb)
-2. Pin the extension to your toolbar (click the puzzle icon, then the pin)
-3. Click the extension icon to open the side panel
-4. Click **Sign in with Google** — a tab opens for Google sign-in
-5. Approve the calendar permissions and the tab closes automatically
-6. Your calendar events appear in the side panel
+1. [Download](https://github.com/dr-bizz/Google-Calendar-Chrome-Sidebar/archive/refs/heads/main.zip) or clone this repository
+2. Unzip the download (if you downloaded the zip)
+3. Open `chrome://extensions` (or `brave://extensions` / `edge://extensions`)
+4. Enable **Developer mode** (top-right toggle)
+5. Click **Load unpacked** and select the unzipped folder
+6. Pin the extension to your toolbar (click the puzzle icon, then the pin)
+7. Click the extension icon to open the side panel
+8. Click **Sign in with Google** — a tab opens for sign-in, then closes automatically
 
 To connect GitHub PR reviews, scroll to the bottom of the side panel and click **Connect GitHub**.
 
 No configuration, no API keys, no setup required.
+
+> **To update:** Download the latest zip, replace the files in the same folder, then click **reload** on `chrome://extensions`. Don't remove and re-add — that changes the Extension ID.
+
+### Alternative: Chrome Web Store
+
+Also available on the [Chrome Web Store](https://chromewebstore.google.com/detail/fefpaminbjodcadohglcnikaklhbjfgb). Same extension, but Web Store updates may lag behind the latest source by up to 2 weeks.
+
+> **Note:** Google OAuth is currently approved for Cru organization accounts. External access is pending Google's verification review.
 
 ## Troubleshooting
 
