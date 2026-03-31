@@ -29,62 +29,93 @@ A Chrome/Brave/Edge extension that displays your Google Calendar in the browser'
 - **Repo filtering** — choose which repos to show via settings gear
 - **Badge integration** — extension badge shows PR count when no meeting is imminent
 
-## Install from Chrome Web Store
+## Install
 
-> **Status: Pending approval.** The extension has been submitted and is awaiting Chrome Web Store review.
+### From the Chrome Web Store
 
-Once approved, install from the [Chrome Web Store listing](https://chromewebstore.google.com/detail/fefpaminbjodcadohglcnikaklhbjfgb/preview):
+> **Note:** Google OAuth is currently approved for Cru organization accounts. External access is pending Google's verification review. If you're outside Cru, see [Developer Setup](#developer-setup) below to run your own instance.
 
-1. Click **Add to Chrome**
+1. Install from the [Chrome Web Store](https://chromewebstore.google.com/detail/fefpaminbjodcadohglcnikaklhbjfgb)
 2. Pin the extension to your toolbar (click the puzzle icon, then the pin)
 3. Click the extension icon to open the side panel
-4. Click **Sign in with Google** — a new tab opens for Google sign-in
+4. Click **Sign in with Google** — a tab opens for Google sign-in
 5. Approve the calendar permissions and the tab closes automatically
 6. Your calendar events appear in the side panel
 
 To connect GitHub PR reviews, scroll to the bottom of the side panel and click **Connect GitHub**.
 
-No configuration, no API keys, no setup required — it just works.
+No configuration, no API keys, no setup required.
 
-## Install from Source (Developer Setup)
+## Troubleshooting
 
-If you want to load the extension directly from the source code (for development or before Web Store approval):
+**Sign-in opens a tab but nothing happens:**
+- Make sure you're using a Cru organization Google account (external access is pending approval)
+- Try closing the tab and clicking "Sign in" again
+
+**"No refresh token received" error:**
+- Go to [Google Account Permissions](https://myaccount.google.com/permissions), revoke access to "Google Calendar Side Panel", and try signing in again
+
+**Session expired:**
+The extension automatically refreshes tokens every 55 minutes. If you see a re-auth prompt, your session may have expired (90-day limit). Click "Sign in" again.
+
+**GitHub sign-in fails:**
+- Make sure you approve the permissions on the GitHub consent screen
+- Try disconnecting and reconnecting from the PR section
+
+**PR reviews not loading:**
+- Check your internet connection
+- Try clicking the refresh button in the toolbar
+
+## Privacy
+
+Your calendar data goes directly from your browser to Google's servers — it never passes through any third-party server. The only server involved is a Cloudflare Worker that handles OAuth token exchange (signing you in). Refresh tokens are stored server-side on Cloudflare; your browser only holds an opaque session token. No analytics, no tracking, no data sharing.
+
+The optional GitHub integration communicates directly with GitHub's API from your browser.
+
+See [PRIVACY.md](PRIVACY.md) for the full policy.
+
+---
+
+## Developer Setup
+
+If you want to contribute to this project or run your own instance (e.g., you're outside the Cru organization), you'll need to set up your own Cloudflare Worker and Google Cloud project.
+
+### Prerequisites
+
+- Chrome, Brave, or Edge browser
+- [Node.js](https://nodejs.org) installed
+- A [Google Cloud](https://console.cloud.google.com/) account (free)
+- A [Cloudflare](https://cloudflare.com) account (free tier)
+- *(Optional)* A [GitHub](https://github.com) account for PR review integration
 
 ### Step 1: Load the Extension
 
-1. Clone or download this repository
+1. Clone this repository
 2. Open `chrome://extensions` (or `brave://extensions` / `edge://extensions`)
 3. Enable **Developer mode** (top-right toggle)
 4. Click **Load unpacked** and select the project folder
-5. Pin the extension to your toolbar
 
-> **Important:** Never remove and re-add the extension. If you need to update, replace the files and click the **reload** button. Removing it changes the Extension ID and breaks your OAuth configuration.
+> **Tip:** Never remove and re-add the extension — it changes the Extension ID. Use the **reload** button instead.
 
-### Step 2: Deploy the Auth Worker
+### Step 2: Set Up Google OAuth
 
-The extension uses a Cloudflare Worker for OAuth token exchange. You need to deploy your own:
-
-**Prerequisites:**
-- A [Cloudflare](https://cloudflare.com) account (free tier works)
-- A [Google Cloud](https://console.cloud.google.com/) account (free)
-- Node.js installed
-
-**A) Set up Google OAuth:**
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project and enable **Google Calendar API**
-3. Go to [Auth Overview](https://console.cloud.google.com/auth/overview) and configure the consent screen (External, add your email as test user, add `calendar.events` scope)
-4. Go to [Auth Clients](https://console.cloud.google.com/auth/clients) → **+ Create Client** → **Web application**
-5. Under **Authorized redirect URIs**, add: `https://YOUR-WORKER-NAME.YOUR-ACCOUNT.workers.dev/google/callback`
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a new project
+2. Enable the **Google Calendar API** in the [API Library](https://console.cloud.google.com/apis/library)
+3. Configure the [OAuth consent screen](https://console.cloud.google.com/auth/overview):
+   - Set to **External**
+   - Add your email as a test user
+   - Add the `calendar.events` and `calendar.readonly` scopes
+4. Create an [OAuth client](https://console.cloud.google.com/auth/clients) → **Web application**
+5. Under **Authorized redirect URIs**, add: `https://YOUR-WORKER.YOUR-ACCOUNT.workers.dev/google/callback`
 6. Copy the **Client ID** and **Client Secret**
 
-**B) Set up GitHub OAuth (optional, for PR reviews):**
+### Step 3: Set Up GitHub OAuth (Optional)
 
 1. Go to [GitHub Developer Settings](https://github.com/settings/developers) → **New OAuth App**
-2. Set **Authorization callback URL** to: `https://YOUR-WORKER-NAME.YOUR-ACCOUNT.workers.dev/github/callback`
+2. Set **Authorization callback URL** to: `https://YOUR-WORKER.YOUR-ACCOUNT.workers.dev/github/callback`
 3. Copy the **Client ID** and generate a **Client Secret**
 
-**C) Deploy the worker:**
+### Step 4: Deploy the Worker
 
 ```bash
 cd worker
@@ -93,11 +124,9 @@ wrangler login                # authenticate with Cloudflare
 wrangler kv namespace create "AUTH_TOKENS"
 ```
 
-Update `worker/wrangler.toml`:
-- Set the KV namespace `id` from the output above
-- Set `EXTENSION_ID` to your extension's ID (from `chrome://extensions`)
+Update `worker/wrangler.toml` with the KV namespace `id` from the output above.
 
-Then deploy and set secrets:
+Deploy and set secrets:
 
 ```bash
 npx wrangler deploy
@@ -107,21 +136,20 @@ npx wrangler secret put GITHUB_CLIENT_ID      # optional
 npx wrangler secret put GITHUB_CLIENT_SECRET   # optional
 ```
 
-**D) Update extension config:**
+### Step 5: Update Extension Config
 
-1. Open `background.js` — update the `WORKER_URL` on line 2 to your deployed worker URL
+1. Open `background.js` — update `WORKER_URL` on line 2 to your deployed worker URL
 2. Open `manifest.json` — update the worker domain in `host_permissions`
 
-### Step 3: Reload and Test
+### Step 6: Reload and Test
 
-1. Go to `chrome://extensions` and click **reload** on the extension
-2. Click the extension icon to open the side panel
-3. Click **Sign in with Google** — a tab opens, you sign in, and it auto-closes
-4. *(If GitHub configured)* Scroll down and click **Connect GitHub**
+1. Go to `chrome://extensions` and click **reload**
+2. Open the side panel and click **Sign in with Google**
+3. *(If GitHub configured)* Click **Connect GitHub**
 
-### Development
+### Development Workflow
 
-There's no build step — edit files directly and reload:
+No build step — edit files directly and reload:
 
 1. Make changes to the source files
 2. Click reload on `chrome://extensions`
@@ -133,11 +161,10 @@ There's no build step — edit files directly and reload:
 
 | File | Responsibility |
 |------|---------------|
-| `background.js` | Service worker: OAuth coordination, token lifecycle, alarms (badge, notifications, PR polling), message handling |
+| `background.js` | Service worker: OAuth coordination via tab URL interception, token lifecycle, alarms (badge, notifications, PR polling), message handling |
 | `sidepanel.js` | UI logic: Google Calendar + GitHub API calls, rendering, event handling, RSVP, PR cards |
 | `sidepanel.html` | Markup and embedded CSS (light/dark themes via CSS variables) |
-| `oauth_callback.js/html` | Multi-provider OAuth redirect handler (Google + GitHub) |
-| `worker/auth-token-exchange.js` | Cloudflare Worker: OAuth token exchange, refresh token storage (KV), session management |
+| `worker/auth-token-exchange.js` | Cloudflare Worker: OAuth flows for both Google and GitHub, KV token storage, session management |
 
 ### Authentication
 
@@ -147,48 +174,21 @@ Both Google and GitHub use the same pattern — a Cloudflare Worker owns the OAu
 2. Worker redirects to the provider's consent screen
 3. Provider redirects back to the worker with an authorization code
 4. Worker exchanges code + client secret for tokens
-5. Worker stores sensitive tokens (refresh/access) in Cloudflare KV
-6. Worker redirects to extension's `oauth_callback.html` with an opaque session token
-7. Extension stores the session token locally
+5. Worker stores sensitive tokens (refresh/access) in Cloudflare KV (90-day TTL)
+6. Worker redirects to its own `/auth/complete` page with an opaque session token
+7. Extension detects the `/auth/complete` URL via `chrome.tabs.onUpdated`, extracts the session token, and closes the tab
 
 This means:
 - **Client secrets never leave the worker** — they're Cloudflare secrets
 - **Refresh tokens stay server-side** — only the worker can use them
 - **Works for all users** — the redirect URI is the worker URL, not per-extension
 - **No browser-specific APIs** — works identically in Chrome, Brave, and Edge
-
-### Data Flow
-
-- **Calendar:** `background.js` manages session tokens → refreshes access tokens via worker → `sidepanel.js` fetches events from Google Calendar API → renders timeline, cards, alerts → caches in `chrome.storage.local`
-- **GitHub PRs:** `sidepanel.js` retrieves access token from worker → fetches from GitHub Search + PR detail APIs → enriches with review history + timeline → renders PR cards → `background.js` handles background polling + notifications + badge
+- **Survives service worker restarts** — top-level tab listener re-registers automatically
 
 ### Storage
 
 - `chrome.storage.local` — session tokens, cached access tokens, cached events/PRs, notification tracking, repo filter
 - `localStorage` — UI preferences (dark mode, collapse states, calendar filter)
-
-## Troubleshooting
-
-### Google Calendar
-
-**Sign-in opens a tab but nothing happens:**
-- Check that your worker is deployed and reachable
-- Verify the Google OAuth redirect URI matches `https://YOUR-WORKER/google/callback`
-
-**"No refresh token received" error:**
-- Go to [Google Account Permissions](https://myaccount.google.com/permissions), revoke access to the app, and try signing in again
-
-**Token expired / session expired:**
-The extension automatically refreshes tokens every 55 minutes. If you see a re-auth prompt, your server-side session may have expired (90-day TTL). Click "Sign in" again.
-
-### GitHub PR Reviews
-
-**GitHub sign-in fails:**
-Check that the Authorization callback URL in your GitHub OAuth App matches `https://YOUR-WORKER/github/callback`.
-
-**PR reviews not loading:**
-- Verify the Cloudflare Worker is deployed and reachable
-- Check the worker domain in `manifest.json` `host_permissions`
 
 ## Contributing
 
@@ -200,12 +200,6 @@ Check that the Authorization callback URL in your GitHub OAuth App matches `http
 | Auth flow, token refresh, badge | `background.js` |
 | OAuth token exchange, KV storage | `worker/auth-token-exchange.js` |
 | Permissions, metadata | `manifest.json` |
-
-## Privacy
-
-All calendar data communicates only with Google APIs (`googleapis.com`). The optional GitHub PR feature communicates with GitHub API (`api.github.com`). OAuth token exchange goes through a Cloudflare Worker that stores refresh tokens server-side — no tokens are shared with any other service. No analytics, no tracking, no third-party data sharing.
-
-See [PRIVACY.md](PRIVACY.md) for the full policy.
 
 ## License
 
