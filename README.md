@@ -35,20 +35,19 @@ A Chrome/Brave/Edge extension that displays your Google Calendar in the browser'
 
 Chrome Web Store updates can take up to 2 weeks to approve, so loading from source gets you the latest features immediately.
 
-1. [Download](https://github.com/dr-bizz/Google-Calendar-Chrome-Sidebar/archive/refs/heads/main.zip) or clone this repository
-2. Unzip the download (if you downloaded the zip)
-3. Open `chrome://extensions` (or `brave://extensions` / `edge://extensions`)
-4. Enable **Developer mode** (top-right toggle)
-5. Click **Load unpacked** and select the unzipped folder
-6. Pin the extension to your toolbar (click the puzzle icon, then the pin)
-7. Click the extension icon to open the side panel
-8. Click **Sign in with Google** — a tab opens for sign-in, then closes automatically
+1. Clone this repository: `git clone https://github.com/dr-bizz/Google-Calendar-Chrome-Sidebar.git`
+2. Open `chrome://extensions` (or `brave://extensions` / `edge://extensions`)
+3. Enable **Developer mode** (top-right toggle)
+4. Click **Load unpacked** and select the cloned folder
+5. Pin the extension to your toolbar (click the puzzle icon, then the pin)
+6. Click the extension icon to open the side panel
+7. Click **Sign in with Google** — a tab opens for sign-in, then closes automatically
 
 To connect GitHub PR reviews, scroll to the bottom of the side panel and click **Connect GitHub**.
 
 No configuration, no API keys, no setup required.
 
-> **To update:** Download the latest zip, replace the files in the same folder, then click **reload** on `chrome://extensions`. Don't remove and re-add — that changes the Extension ID.
+> **To update:** `git pull` then click **reload** on `chrome://extensions`.
 
 ### Alternative: Chrome Web Store
 
