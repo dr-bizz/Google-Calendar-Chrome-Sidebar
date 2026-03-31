@@ -15,37 +15,39 @@ Google Calendar Side Panel — a Manifest V3 Chrome extension (also works in Bra
 
 ## Architecture
 
-**Five source files + one external worker:**
+**Four source files + one external worker:**
 
-- **`background.js`** (service worker) — Google OAuth authentication (launchWebAuthFlow → tab-based fallback → manual token entry), GitHub OAuth (launchWebAuthFlow → Cloudflare Worker code exchange), token lifecycle management, background alarms (badge update, event refresh, notification checks, PR polling every 10 min), and message handling between sidepanel and APIs.
+- **`background.js`** (service worker) — OAuth coordination (opens worker auth URLs, watches tab URLs via `chrome.tabs.onUpdated` for `/auth/complete` redirects), token lifecycle management (caching access tokens locally, refreshing via worker, deduplicating concurrent refreshes), background alarms (badge update, event refresh, notification checks, PR polling every 10 min), and message handling between sidepanel and APIs.
 
 - **`sidepanel.js`** — All UI logic: fetches events from Google Calendar API v3 and PRs from GitHub REST API, renders mini calendar, timeline, event cards, day summary, RSVP handling, PR review cards, PR detail slide-out, meeting alerts. Manages preferences via `localStorage`. Polls PRs every 2 minutes when panel is open.
 
 - **`sidepanel.html`** — Markup and embedded CSS (light/dark themes via CSS variables, animations, responsive layout). All styles are inline in a single `<style>` tag.
 
-- **`oauth_callback.js` + `oauth_callback.html`** — Google OAuth redirect handler that extracts the access token from the URL hash and sends it to background.js.
-
-- **`worker/github-token-exchange.js`** — Cloudflare Worker that exchanges GitHub OAuth authorization codes for access tokens. Deployed separately to Cloudflare Workers. CORS restricted to the extension origin.
+- **`worker/auth-token-exchange.js`** — Unified Cloudflare Worker handling both Google and GitHub OAuth. Routes: `/google/auth`, `/google/callback`, `/google/refresh`, `/github/auth`, `/github/callback`, `/github/retrieve`, `/revoke`, `/auth/complete`. Stores Google refresh tokens and GitHub access tokens in Cloudflare KV. Returns opaque session tokens to the extension. CORS restricted to the extension origin. Deployed separately to Cloudflare Workers.
 
 **Data flow:**
-- **Calendar:** User interaction → sidepanel.js sends Chrome messages → background.js handles auth/tokens → sidepanel.js calls Google Calendar API directly with token → renders UI. Events cached in `chrome.storage.local`.
-- **GitHub PRs:** sidepanel.js fetches from GitHub Search API → enriches with PR details, reviews, and timeline → renders PR cards. background.js handles 10-min background polling, desktop notifications for new review requests, and badge updates.
+- **Calendar:** User clicks Sign In → background.js opens tab to worker `/google/auth` → worker redirects to Google consent → Google redirects back to worker `/google/callback` → worker exchanges code for tokens, stores refresh token in KV → worker redirects to its own `/auth/complete` page with session token in query params → extension's top-level `chrome.tabs.onUpdated` listener detects the `/auth/complete` URL, extracts session token, then calls `/google/refresh` to get an access token → sidepanel.js calls Google Calendar API directly with cached access token → renders UI. Access token refreshed via worker every 55 minutes.
+- **GitHub PRs:** User clicks Connect GitHub → same tab-based flow through worker → worker redirects to `/auth/complete` with session token → extension extracts session token via `chrome.tabs.onUpdated` → sidepanel.js retrieves access token from worker on panel open, caches in memory → fetches from GitHub Search API → enriches with PR details, reviews, and timeline → renders PR cards. background.js handles 10-min background polling, desktop notifications for new review requests, and badge updates.
 
 ## Key Configuration
 
-- **Google OAuth Client ID** is defined in two places: `background.js` line 2 (`CLIENT_ID`) and `manifest.json` (`oauth2.client_id`). Both must match.
-- **GitHub OAuth** config: `GITHUB_CLIENT_ID` and `GITHUB_WORKER_URL` in `background.js`. The worker domain must also be in `manifest.json` `host_permissions`.
-- **Permissions** in `manifest.json`: `sidePanel`, `storage`, `tabs`, `identity`, `alarms`, `notifications`
+- **Worker URL** is defined in `background.js` line 2 (`WORKER_URL`). Must match the deployed Cloudflare Worker domain.
+- **Worker environment variables** (set via `wrangler secret put`): `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`
+- **Worker vars** (in `wrangler.toml`): `EXTENSION_ID` — the Chrome extension ID for CORS and redirect URLs
+- **Permissions** in `manifest.json`: `sidePanel`, `storage`, `tabs`, `alarms`, `notifications`
+- **Host permissions**: `googleapis.com`, `api.github.com`, worker domain
 - **Google OAuth scopes**: `calendar.events` (read/write + RSVP) and `calendar.readonly` (list calendars)
 - **GitHub OAuth scope**: `repo` (required for private repo PR access — no narrower scope available)
 
 ## Auth Token Lifecycle
 
-**Google:** Implicit OAuth flow with ~1 hour expiry. Silent refresh triggered at 45 minutes via `checkToken` alarm. On 401 API response, `tryReAuth()` attempts silent refresh then cross-tab token pickup. Manual token entry available as last-resort fallback.
+**Google:** Authorization code flow via Cloudflare Worker. Worker exchanges code for access token + refresh token. Refresh token stored server-side in KV (90-day TTL). Access token cached locally in `chrome.storage.local` with timestamp. Background alarm refreshes at 55 minutes via `POST /google/refresh` to worker. On 401 API response, `tryReAuth()` attempts refresh via worker. On 401/404 from worker (session expired), local session is cleared and user must re-authenticate.
 
-**GitHub:** OAuth tokens don't expire unless revoked. Validated via `GET /user` on session start. On 401 from any GitHub API call, token is cleared and user is prompted to reconnect. Token exchange goes through the Cloudflare Worker (client secret never in the extension).
+**GitHub:** Authorization code flow via same worker. Worker exchanges code for access token, stores in KV (90-day TTL). Extension stores opaque session token locally. Access token retrieved from worker on panel open, cached in memory for the session. On 401 from any GitHub API call, token is cleared and user is prompted to reconnect.
+
+**Session tokens:** Opaque UUIDs generated by the worker. Stored in `chrome.storage.local`. Used to retrieve/refresh real tokens from the worker. Client secrets never leave the worker.
 
 ## Storage
 
-- **`chrome.storage.local`**: Google token (`accessToken`, `tokenTime`), GitHub token (`githubToken`, `githubTokenTime`, `githubUsername`), cached events (`cachedEvents`, `cacheTime`), cached PRs (`cachedPRs`, `prCacheTime`), notification tracking (`notifiedEventKeys`, `notifiedPRKeys`), PR repo filter (`enabledPRRepos`)
-- **`localStorage`**: UI preferences — dark mode, compact mode, mini calendar collapsed state, enabled calendar IDs, PR section collapsed state
+- **`chrome.storage.local`**: Google session (`googleSessionToken`, `googleAccessToken`, `googleTokenTime`), GitHub session (`githubSessionToken`, `githubUsername`), cached events (`cachedEvents`, `cacheTime`), cached PRs (`cachedPRs`, `prCacheTime`), notification tracking (`notifiedEventKeys`, `notifiedPRKeys`), PR repo filter (`enabledPRRepos`)
+- **`localStorage`**: UI preferences — dark mode, mini calendar collapsed state, enabled calendar IDs, PR section collapsed state, show upcoming toggle

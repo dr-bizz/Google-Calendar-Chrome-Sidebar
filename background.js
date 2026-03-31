@@ -1,13 +1,6 @@
 // ---- CONFIG ----
-const CLIENT_ID = '213142139393-3e1ihmchu6h0etig6p9olgbj1hhc9oak.apps.googleusercontent.com';
-const SCOPES = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly';
-
-// ---- GITHUB CONFIG ----
-const GITHUB_CLIENT_ID = 'Ov23liLXcKeNsvuH4dg4';
-const GITHUB_WORKER_URL = 'https://github-token-exchange.dr-bizz.workers.dev';
-// 'repo' scope is required to access private repository PRs via the GitHub API.
-// GitHub does not offer a narrower scope for read-only PR access on private repos.
-const GITHUB_SCOPE = 'repo';
+const WORKER_URL = 'https://auth-token-exchange.dr-bizz.workers.dev';
+let _refreshPromise = null;
 
 // ---- SIDE PANEL SETUP ----
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -18,61 +11,148 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       await chrome.sidePanel.setOptions({ tabId, path: 'sidepanel.html', enabled: true });
     } catch (e) {}
   }
+
+  // Catch OAuth completion if service worker restarted during auth flow
+  if (changeInfo.url && changeInfo.url.includes('/auth/complete')) {
+    try {
+      const resultUrl = new URL(changeInfo.url);
+      const sessionToken = resultUrl.searchParams.get('session_token');
+      const provider = resultUrl.searchParams.get('provider');
+      const error = resultUrl.searchParams.get('error');
+
+      if (error || !sessionToken || !provider) {
+        try { chrome.tabs.remove(tabId); } catch (e) {}
+        return;
+      }
+
+      if (provider === 'google') {
+        await chrome.storage.local.set({ googleSessionToken: sessionToken });
+        await refreshGoogleToken();
+      } else if (provider === 'github') {
+        await chrome.storage.local.set({ githubSessionToken: sessionToken });
+      }
+
+      try { chrome.tabs.remove(tabId); } catch (e) {}
+    } catch (e) {
+      console.error('[Auth] Error processing auth completion:', e);
+    }
+  }
 });
 
 // ---- HELPERS ----
-function getRedirectURL() {
-  try {
-    return chrome.identity.getRedirectURL();
-  } catch (e) {
-    return `https://${chrome.runtime.id}.chromiumapp.org/`;
-  }
-}
-
-function buildAuthURL(redirectUri, { silent = false } = {}) {
-  const params = new URLSearchParams({
-    client_id: CLIENT_ID,
-    response_type: 'token',
-    redirect_uri: redirectUri,
-    scope: SCOPES,
-    access_type: 'online'
-  });
-  if (silent) params.set('prompt', 'none');
-  else params.set('prompt', 'select_account');
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-}
-
 function isSafeUrl(url) {
   try { return new URL(url).protocol === 'https:'; } catch { return false; }
 }
 
-function extractTokenFromUrl(url) {
+async function refreshGoogleToken() {
+  if (_refreshPromise) return _refreshPromise;
+  _refreshPromise = _doRefreshGoogleToken();
   try {
-    const hashIndex = url.indexOf('#');
-    if (hashIndex === -1) return null;
-    const hash = url.substring(hashIndex + 1);
-    const params = new URLSearchParams(hash);
-    return params.get('access_token');
+    return await _refreshPromise;
+  } finally {
+    _refreshPromise = null;
+  }
+}
+
+async function _doRefreshGoogleToken() {
+  const data = await chrome.storage.local.get(['googleSessionToken']);
+  if (!data.googleSessionToken) {
+    return null;
+  }
+  try {
+    const response = await fetch(`${WORKER_URL}/google/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_token: data.googleSessionToken }),
+    });
+    if (response.status === 401 || response.status === 404) {
+      console.log('[Auth] Session expired on worker, clearing local session');
+      await chrome.storage.local.remove(['googleSessionToken', 'googleAccessToken', 'googleTokenTime']);
+      return null;
+    }
+    if (!response.ok) {
+      console.log('[Auth] Token refresh failed with status:', response.status);
+      return null;
+    }
+    const result = await response.json();
+    if (result.access_token) {
+      await chrome.storage.local.set({
+        googleAccessToken: result.access_token,
+        googleTokenTime: Date.now(),
+      });
+      chrome.alarms.create('tokenRefresh', { delayInMinutes: 55 });
+      return result.access_token;
+    }
+    return null;
   } catch (e) {
-    console.error('[Auth] Token extraction error:', e);
+    console.error('[Auth] Token refresh error:', e);
     return null;
   }
 }
 
-async function storeToken(token) {
-  await chrome.storage.local.set({ accessToken: token, tokenTime: Date.now() });
-  // Schedule a proactive token refresh at 45 minutes
-  chrome.alarms.create('tokenRefresh', { delayInMinutes: 45 });
+async function retrieveGitHubToken() {
+  const data = await chrome.storage.local.get(['githubSessionToken']);
+  if (!data.githubSessionToken) {
+    return null;
+  }
+  try {
+    const response = await fetch(`${WORKER_URL}/github/retrieve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_token: data.githubSessionToken }),
+    });
+    if (response.status === 401 || response.status === 404) {
+      console.log('[GitHub] Session expired on worker, clearing local session');
+      await chrome.storage.local.remove(['githubSessionToken', 'githubUsername']);
+      return null;
+    }
+    if (!response.ok) {
+      console.log('[GitHub] Token retrieval failed with status:', response.status);
+      return null;
+    }
+    const result = await response.json();
+    return result.access_token || null;
+  } catch (e) {
+    console.error('[GitHub] Token retrieval error:', e);
+    return null;
+  }
+}
+
+async function revokeSession(provider) {
+  const storageKey = provider === 'google' ? 'googleSessionToken' : 'githubSessionToken';
+  const data = await chrome.storage.local.get([storageKey]);
+  const sessionToken = data[storageKey];
+  if (sessionToken) {
+    try {
+      await fetch(`${WORKER_URL}/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_token: sessionToken, provider }),
+      });
+    } catch (e) {
+      console.log(`[Auth] Revoke ${provider} error (best-effort):`, e.message);
+    }
+  }
+  if (provider === 'google') {
+    await chrome.storage.local.remove(['googleSessionToken', 'googleAccessToken', 'googleTokenTime']);
+  } else {
+    await chrome.storage.local.remove(['githubSessionToken', 'githubUsername']);
+  }
 }
 
 // ---- ALARMS SETUP ----
 // Create alarms on install/update to avoid resetting timers on every worker wake
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create('refreshEvents', { periodInMinutes: 5 });
   chrome.alarms.create('checkToken', { periodInMinutes: 1 });
   chrome.alarms.create('updateBadge', { periodInMinutes: 1 });
   chrome.alarms.create('checkNotifications', { periodInMinutes: 1 });
   chrome.alarms.create('checkPRs', { periodInMinutes: 10 });
+
+  // Clean up old storage keys from pre-v8 auth architecture
+  if (details.reason === 'update') {
+    chrome.storage.local.remove(['accessToken', 'tokenTime', 'githubToken', 'githubTokenTime']);
+  }
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -82,31 +162,19 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (alarm.name === 'checkToken' || alarm.name === 'tokenRefresh') {
-    // Proactive token refresh: if token is older than 45 minutes, silently re-auth.
-    // Uses await so the service worker stays alive until the refresh completes.
     try {
-      const data = await chrome.storage.local.get(['tokenTime']);
-      if (data.tokenTime) {
-        const age = Date.now() - data.tokenTime;
-        if (age > 2700000) { // 45 minutes
-          console.log('[Alarms] Token is older than 45 minutes, attempting silent re-auth');
-          try {
-            const redirectUri = getRedirectURL();
-            const authUrl = buildAuthURL(redirectUri, { silent: true });
-
-            const responseUrl = await chrome.identity.launchWebAuthFlow(
-              { url: authUrl, interactive: false }
-            );
-            if (responseUrl) {
-              const token = extractTokenFromUrl(responseUrl);
-              if (token) {
-                console.log('[Alarms] Silent re-auth succeeded');
-                await storeToken(token);
-              }
-            }
-          } catch (e) {
-            // launchWebAuthFlow rejects when interactive:false can't complete silently
-            console.log('[Alarms] Silent re-auth failed:', e.message || e);
+      const data = await chrome.storage.local.get(['googleSessionToken', 'googleTokenTime']);
+      if (data.googleSessionToken && data.googleTokenTime) {
+        const age = Date.now() - data.googleTokenTime;
+        // 55 minutes is a safe threshold to refresh before the typical 1-hour expiry, allowing some buffer for delays
+        if (age > 3300000) {
+          console.log('[Alarms] Token older than 55 min, refreshing via worker');
+          const accessToken = await refreshGoogleToken();
+          if (accessToken) {
+            console.log('[Alarms] Token refresh succeeded');
+            chrome.runtime.sendMessage({ type: 'tokenRefreshed', accessToken }).catch(() => {});
+          } else {
+            console.log('[Alarms] Token refresh failed');
           }
         }
       }
@@ -258,24 +326,35 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
   if (alarm.name === 'checkPRs') {
     try {
-      const data = await chrome.storage.local.get(['githubToken', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'enabledPRRepos']);
-      if (!data.githubToken || !data.githubUsername) return;
+      const data = await chrome.storage.local.get(['githubSessionToken', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'enabledPRRepos']);
+      if (!data.githubSessionToken || !data.githubUsername) {
+        return;
+      }
 
       // Deduplication: skip if cache was updated less than 90 seconds ago
-      if (data.prCacheTime && Date.now() - data.prCacheTime < 90000) return;
+      if (data.prCacheTime && Date.now() - data.prCacheTime < 90000) {
+        return;
+      }
+
+      // Retrieve GitHub token from worker for this poll cycle
+      const ghToken = await retrieveGitHubToken();
+      if (!ghToken) {
+        return;
+      }
 
       // Lightweight search-only fetch (no enrichment)
       const searchUrl = `https://api.github.com/search/issues?q=type:pr+review-requested:${encodeURIComponent(data.githubUsername)}+is:open&per_page=100`;
       const response = await fetch(searchUrl, {
         headers: {
-          'Authorization': `Bearer ${data.githubToken}`,
+          'Authorization': `Bearer ${ghToken}`,
           'Accept': 'application/vnd.github+json',
           'X-GitHub-Api-Version': '2022-11-28',
         },
       });
 
       if (response.status === 401) {
-        await chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'githubUsername', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys']);
+        await revokeSession('github');
+        await chrome.storage.local.remove(['cachedPRs', 'prCacheTime', 'notifiedPRKeys']);
         return;
       }
 
@@ -284,7 +363,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         return;
       }
 
-      if (!response.ok) return;
+      if (!response.ok) {
+        return;
+      }
 
       const searchData = await response.json();
       const newPRs = (searchData.items || []).map(item => {
@@ -307,7 +388,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
       for (const pr of newPRs) {
         // Respect repo filter
-        if (enabledRepos && !enabledRepos.has(pr.repo)) continue;
+        if (enabledRepos && !enabledRepos.has(pr.repo)) {
+          continue;
+        }
 
         if (!oldIds.has(pr.id) && !notifiedKeys.has(`pr::${pr.id}`)) {
           const oldPR = (data.cachedPRs || []).find(p => p.id === pr.id);
@@ -359,7 +442,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // ---- NOTIFICATION HANDLERS ----
 function findEventFromNotification(notificationId, callback) {
   chrome.storage.local.get(['cachedEvents'], (data) => {
-    if (!data.cachedEvents) { callback(null); return; }
+    if (!data.cachedEvents) { 
+      callback(null);
+      return;
+    }
     const delimIdx = notificationId.lastIndexOf('::');
     const eventId = delimIdx !== -1 ? notificationId.substring(0, delimIdx) : notificationId;
     const event = data.cachedEvents.find(e => e.id === eventId);
@@ -387,7 +473,9 @@ chrome.notifications.onClicked.addListener((notificationId) => {
   } else {
     // Calendar event notification
     findEventFromNotification(notificationId, (event) => {
-      if (event) openEventUrl(event);
+      if (event) {
+        openEventUrl(event);
+      }
     });
   }
   chrome.notifications.clear(notificationId);
@@ -416,106 +504,15 @@ chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) =
   chrome.notifications.clear(notificationId);
 });
 
-// ---- AUTH STRATEGY 1: chrome.identity.getAuthToken() ----
-// Works in Chrome with "Chrome Extension" client type.
-// Requires manifest.json oauth2 section with correct client_id.
-// May not work in Brave (Brave doesn't connect to Chrome Web Store).
-async function authViaGetAuthToken() {
+// ---- AUTH FUNCTIONS ----
+// Shared helper: opens an auth tab and watches for the worker's /auth/complete redirect.
+// The worker redirects to /auth/complete?session_token=...&provider=... after OAuth.
+// We intercept this via chrome.tabs.onUpdated (works in Brave, Chrome, Edge).
+function startOAuthFlow(provider) {
   return new Promise((resolve) => {
-    console.log('[Auth Strategy 1] getAuthToken (Chrome standard)');
-
-    if (!chrome.identity || !chrome.identity.getAuthToken) {
-      console.warn('[Auth Strategy 1] getAuthToken not available');
-      resolve({ error: 'getAuthToken not available in this browser' });
-      return;
-    }
-
-    // Set a timeout — getAuthToken can hang in Brave
-    const timeout = setTimeout(() => {
-      console.warn('[Auth Strategy 1] Timed out after 10s');
-      resolve({ error: 'getAuthToken timed out (not supported in this browser)' });
-    }, 10000);
-
-    try {
-      chrome.identity.getAuthToken({ interactive: true }, (token) => {
-        clearTimeout(timeout);
-        if (chrome.runtime.lastError) {
-          console.warn('[Auth Strategy 1] Failed:', chrome.runtime.lastError.message);
-          resolve({ error: chrome.runtime.lastError.message });
-          return;
-        }
-        if (token) {
-          console.log('[Auth Strategy 1] Success!');
-          storeToken(token);
-          resolve({ token });
-        } else {
-          resolve({ error: 'No token returned' });
-        }
-      });
-    } catch (e) {
-      clearTimeout(timeout);
-      console.warn('[Auth Strategy 1] Exception:', e.message);
-      resolve({ error: e.message });
-    }
-  });
-}
-
-// ---- AUTH STRATEGY 2: launchWebAuthFlow ----
-// Works with a "Web application" OAuth client that has the chromiumapp.org
-// redirect URI registered. This is the recommended approach for Brave/Edge.
-async function authViaWebAuthFlow() {
-  return new Promise((resolve) => {
-    const redirectUri = getRedirectURL();
-    const authUrl = buildAuthURL(redirectUri);
-
-    console.log('[Auth Strategy 2] launchWebAuthFlow');
-    console.log('[Auth Strategy 2] Redirect URI:', redirectUri);
-    console.log('[Auth Strategy 2] Full auth URL:', authUrl);
-
-    try {
-      chrome.identity.launchWebAuthFlow(
-        { url: authUrl, interactive: true },
-        (responseUrl) => {
-          if (chrome.runtime.lastError) {
-            console.warn('[Auth Strategy 2] Failed:', chrome.runtime.lastError.message);
-            resolve({ error: chrome.runtime.lastError.message });
-            return;
-          }
-          if (!responseUrl) {
-            console.warn('[Auth Strategy 2] No response URL');
-            resolve({ error: 'No response from Google' });
-            return;
-          }
-
-          const token = extractTokenFromUrl(responseUrl);
-          if (token) {
-            console.log('[Auth Strategy 2] Success!');
-            storeToken(token);
-            resolve({ token });
-          } else {
-            console.warn('[Auth Strategy 2] No token in response:', responseUrl);
-            resolve({ error: 'No token in Google response' });
-          }
-        }
-      );
-    } catch (e) {
-      console.warn('[Auth Strategy 2] Exception:', e.message);
-      resolve({ error: e.message });
-    }
-  });
-}
-
-// ---- AUTH STRATEGY 3: Tab-based with chromiumapp.org interception ----
-// Opens auth in a regular tab. Watches for redirect to chromiumapp.org
-// and extracts token. Works as fallback when launchWebAuthFlow fails
-// but the OAuth client is properly configured.
-async function authViaTab() {
-  return new Promise((resolve) => {
-    const redirectUri = getRedirectURL();
-    const authUrl = buildAuthURL(redirectUri);
-
-    console.log('[Auth Strategy 3] Tab-based auth');
-    console.log('[Auth Strategy 3] Redirect URI:', redirectUri);
+    const authUrl = `${WORKER_URL}/${provider}/auth?ext_id=${chrome.runtime.id}`;
+    const completePrefix = `${WORKER_URL}/auth/complete`;
+    console.log(`[${provider} Auth] Opening auth tab:`, authUrl);
 
     chrome.tabs.create({ url: authUrl }, (tab) => {
       if (chrome.runtime.lastError) {
@@ -523,258 +520,129 @@ async function authViaTab() {
         return;
       }
 
-      const tabUpdatedListener = (tabId, changeInfo) => {
-        if (tabId !== tab.id) return;
-
-        // Check both changeInfo.url and try to get the full URL
-        const url = changeInfo.url || '';
-        if (url.startsWith(redirectUri) || url.includes('chromiumapp.org')) {
-          cleanup();
-          const token = extractTokenFromUrl(url);
-          if (token) {
-            console.log('[Auth Strategy 3] Success!');
-            storeToken(token);
-            try { chrome.tabs.remove(tab.id); } catch (e) {}
-            resolve({ token });
-          } else {
-            resolve({ error: 'No token in redirect URL' });
-          }
-        }
-      };
-
-      const tabRemovedListener = (tabId) => {
-        if (tabId === tab.id) {
-          cleanup();
-          setTimeout(() => resolve({ error: 'Auth tab was closed' }), 500);
-        }
-      };
-
       function cleanup() {
-        chrome.tabs.onUpdated.removeListener(tabUpdatedListener);
-        chrome.tabs.onRemoved.removeListener(tabRemovedListener);
+        chrome.tabs.onUpdated.removeListener(urlListener);
+        chrome.tabs.onRemoved.removeListener(tabCloseListener);
         clearTimeout(timer);
       }
 
-      chrome.tabs.onUpdated.addListener(tabUpdatedListener);
-      chrome.tabs.onRemoved.addListener(tabRemovedListener);
+      // Watch the tab URL for the /auth/complete redirect
+      const urlListener = (tabId, changeInfo) => {
+        if (tabId !== tab.id || !changeInfo.url) return;
+        if (!changeInfo.url.startsWith(completePrefix)) return;
+
+        cleanup();
+
+        const resultUrl = new URL(changeInfo.url);
+        const error = resultUrl.searchParams.get('error');
+        const sessionToken = resultUrl.searchParams.get('session_token');
+        const resultProvider = resultUrl.searchParams.get('provider');
+
+        // Close the auth tab
+        try { chrome.tabs.remove(tab.id); } catch (e) {}
+
+        if (error) {
+          resolve({ error });
+          return;
+        }
+
+        if (sessionToken && resultProvider) {
+          resolve({ sessionToken, provider: resultProvider });
+        } else {
+          resolve({ error: 'No session token received' });
+        }
+      };
+
+      chrome.tabs.onUpdated.addListener(urlListener);
 
       const timer = setTimeout(() => {
         cleanup();
-        resolve({ error: 'Auth timed out after 5 minutes' });
+        resolve({ error: 'Sign-in timed out. Please try again.' });
       }, 300000);
+
+      const tabCloseListener = (tabId) => {
+        if (tabId === tab.id) {
+          cleanup();
+          setTimeout(() => resolve({ error: 'Sign-in was cancelled.' }), 500);
+        }
+      };
+      chrome.tabs.onRemoved.addListener(tabCloseListener);
     });
   });
 }
 
-// ---- GITHUB AUTH ----
-async function authViaGitHub() {
-  if (GITHUB_CLIENT_ID === 'YOUR_GITHUB_CLIENT_ID' || GITHUB_WORKER_URL.includes('YOUR_SUBDOMAIN')) {
-    return { error: 'GitHub integration not configured. Update GITHUB_CLIENT_ID and GITHUB_WORKER_URL in background.js.' };
+async function startGoogleAuth() {
+  const result = await startOAuthFlow('google');
+  if (result.error) return result;
+
+  // Store session token first so refreshGoogleToken() can read it
+  await chrome.storage.local.set({ googleSessionToken: result.sessionToken });
+
+  // Fetch access token via /google/refresh using the session token
+  const accessToken = await refreshGoogleToken();
+  if (accessToken) {
+    return { token: accessToken };
   }
-  return new Promise((resolve) => {
-    const redirectUri = getRedirectURL();
-    const state = crypto.randomUUID();
-    const params = new URLSearchParams({
-      client_id: GITHUB_CLIENT_ID,
-      redirect_uri: redirectUri,
-      scope: GITHUB_SCOPE,
-      state,
-    });
-    const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+  return { error: 'Failed to retrieve access token' };
+}
 
-    console.log('[GitHub Auth] Starting OAuth flow');
-    console.log('[GitHub Auth] Redirect URI:', redirectUri);
+async function startGitHubAuth() {
+  const result = await startOAuthFlow('github');
+  if (result.error) return result;
 
-    try {
-      chrome.identity.launchWebAuthFlow(
-        { url: authUrl, interactive: true },
-        async (responseUrl) => {
-          if (chrome.runtime.lastError || !responseUrl) {
-            console.warn('[GitHub Auth] Failed:', chrome.runtime.lastError?.message);
-            resolve({ error: chrome.runtime.lastError?.message || 'No response' });
-            return;
-          }
-
-          try {
-            const url = new URL(responseUrl);
-            const code = url.searchParams.get('code');
-            const returnedState = url.searchParams.get('state');
-
-            if (!code) {
-              resolve({ error: 'No authorization code in response' });
-              return;
-            }
-
-            if (returnedState !== state) {
-              resolve({ error: 'State mismatch — possible CSRF attack' });
-              return;
-            }
-
-            // Exchange code for token via Cloudflare Worker
-            const tokenResponse = await fetch(`${GITHUB_WORKER_URL}/github/token`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ code }),
-            });
-
-            const data = await tokenResponse.json();
-            if (data.error) {
-              resolve({ error: data.error });
-              return;
-            }
-
-            if (data.access_token) {
-              console.log('[GitHub Auth] Success!');
-              await chrome.storage.local.set({
-                githubToken: data.access_token,
-                githubTokenTime: Date.now(),
-              });
-              resolve({ token: data.access_token });
-            } else {
-              resolve({ error: 'No access token in worker response' });
-            }
-          } catch (e) {
-            console.error('[GitHub Auth] Token exchange error:', e);
-            resolve({ error: e.message });
-          }
-        }
-      );
-    } catch (e) {
-      console.warn('[GitHub Auth] Exception:', e.message);
-      resolve({ error: e.message });
-    }
-  });
+  await chrome.storage.local.set({ githubSessionToken: result.sessionToken });
+  return { sessionToken: result.sessionToken };
 }
 
 // ---- MESSAGE HANDLING ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
-  // Silent token refresh — non-interactive, no popup, with timeout
+  // Silent token refresh — via worker
   if (message.type === 'silentRefresh') {
     (async () => {
-      try {
-        const redirectUri = getRedirectURL();
-        const authUrl = buildAuthURL(redirectUri, { silent: true });
-
-        // Use promise-based API with a timeout race
-        const responseUrl = await Promise.race([
-          chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: false }),
-          new Promise(resolve => setTimeout(() => resolve(null), 10000))
-        ]);
-
-        if (!responseUrl) {
-          sendResponse({ token: null });
-          return;
-        }
-        const token = extractTokenFromUrl(responseUrl);
-        if (token) {
-          await storeToken(token);
-          sendResponse({ token });
-        } else {
-          sendResponse({ token: null });
-        }
-      } catch (e) {
-        // launchWebAuthFlow rejects when interactive:false can't complete silently
-        sendResponse({ token: null });
-      }
+      const token = await refreshGoogleToken();
+      sendResponse({ token: token || null });
     })();
     return true;
   }
 
   if (message.type === 'startAuth') {
     (async () => {
-      console.log('[Auth] Starting authentication...');
-      console.log('[Auth] Extension ID:', chrome.runtime.id);
-      console.log('[Auth] Redirect URL:', getRedirectURL());
-
-      // Strategy 1: launchWebAuthFlow (primary — works in both Chrome and Brave
-      // with a "Web application" OAuth client)
-      let result = await authViaWebAuthFlow();
-      if (result.token) {
-        sendResponse(result);
-        return;
-      }
-      console.log('[Auth] launchWebAuthFlow failed:', result.error);
-
-      // Strategy 2: Tab-based (fallback)
-      console.log('[Auth] Trying tab-based auth...');
-      result = await authViaTab();
-      if (result.token) {
-        sendResponse(result);
-        return;
-      }
-      console.log('[Auth] Tab-based failed:', result.error);
-
-      // All strategies failed — return last error with setup guidance
-      sendResponse({
-        error: result.error + '\n\nSetup tip: Make sure you have a "Web application" OAuth client in Google Cloud with this redirect URI:\n' + getRedirectURL()
-      });
+      console.log('[Auth] Starting Google authentication via worker...');
+      const result = await startGoogleAuth();
+      sendResponse(result);
     })();
     return true;
   }
 
   if (message.type === 'getStoredToken') {
-    chrome.storage.local.get(['accessToken', 'tokenTime'], (data) => {
-      if (data.accessToken && data.tokenTime) {
-        const age = Date.now() - data.tokenTime;
-        if (age < 3500000) {
-          sendResponse({ token: data.accessToken });
-        } else {
-          // Token expired — return null but do NOT remove from storage.
-          // Removing it triggers storage.onChanged across all tabs,
-          // causing a sign-out cascade. The stale token sits inert until
-          // overwritten by a successful refresh or cleared by explicit sign-out.
-          sendResponse({ token: null });
-        }
-      } else {
+    (async () => {
+      const data = await chrome.storage.local.get(['googleSessionToken', 'googleAccessToken', 'googleTokenTime']);
+      if (!data.googleSessionToken) {
         sendResponse({ token: null });
+        return;
       }
-    });
+      // Return cached token if fresh (under 55 minutes old)
+      if (data.googleAccessToken && data.googleTokenTime) {
+        const age = Date.now() - data.googleTokenTime;
+         // 55 minutes is a safe threshold to refresh before the typical 1-hour expiry, allowing some buffer for delays
+        if (age < 3300000) {
+          sendResponse({ token: data.googleAccessToken });
+          return;
+        }
+      }
+      // Token is stale or missing — refresh via worker
+      const token = await refreshGoogleToken();
+      sendResponse({ token: token || null });
+    })();
     return true;
   }
 
   if (message.type === 'signOut') {
-    // Also revoke the token with Google if possible.
-    // Set timestamp so other tabs know this is an explicit sign-out (not token expiry).
-    // Tabs check if this timestamp is within the last 5 seconds to decide behavior.
-    chrome.storage.local.set({ explicitSignOutTime: Date.now() }, () => {
-      chrome.storage.local.get(['accessToken'], (data) => {
-        if (data.accessToken) {
-          // Try to revoke the cached Chrome identity token
-          try {
-            chrome.identity.removeCachedAuthToken({ token: data.accessToken }, () => {});
-          } catch (e) {}
-        }
-        chrome.storage.local.remove(['accessToken', 'tokenTime'], () => {
-          sendResponse({ success: true });
-        });
-      });
-    });
-    return true;
-  }
-
-  if (message.type === 'getRedirectURLs') {
-    const redirectUrl = getRedirectURL();
-    const callbackUrl = chrome.runtime.getURL('oauth_callback.html');
-    sendResponse({ redirectUrl, callbackUrl, extensionId: chrome.runtime.id, clientId: CLIENT_ID });
-    return false;
-  }
-
-  if (message.type === 'saveManualToken') {
-    if (message.token) {
-      storeToken(message.token).then(() => sendResponse({ success: true }));
-    } else {
-      sendResponse({ error: 'No token provided' });
-    }
-    return true;
-  }
-
-  if (message.type === 'oauthToken') {
-    if (message.token) {
-      storeToken(message.token).then(() => sendResponse({ success: true }));
-    } else {
-      sendResponse({ success: false });
-    }
+    (async () => {
+      await revokeSession('google');
+      sendResponse({ success: true });
+    })();
     return true;
   }
 
@@ -802,23 +670,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // ---- GITHUB AUTH MESSAGE HANDLERS ----
   if (message.type === 'startGitHubAuth') {
     (async () => {
-      const result = await authViaGitHub();
-      sendResponse(result);
+      const result = await startGitHubAuth();
+      if (result.sessionToken) {
+        const token = await retrieveGitHubToken();
+        sendResponse({ token, sessionToken: result.sessionToken });
+      } else {
+        sendResponse({ error: result.error });
+      }
     })();
     return true;
   }
 
   if (message.type === 'getGitHubToken') {
-    chrome.storage.local.get(['githubToken'], (data) => {
-      sendResponse({ token: data.githubToken || null });
-    });
+    (async () => {
+      const token = await retrieveGitHubToken();
+      sendResponse({ token: token || null });
+    })();
     return true;
   }
 
   if (message.type === 'disconnectGitHub') {
-    chrome.storage.local.remove(['githubToken', 'githubTokenTime', 'cachedPRs', 'prCacheTime', 'notifiedPRKeys', 'githubUsername'], () => {
+    (async () => {
+      await revokeSession('github');
+      await chrome.storage.local.remove(['cachedPRs', 'prCacheTime', 'notifiedPRKeys']);
       sendResponse({ success: true });
-    });
+    })();
     return true;
   }
 
